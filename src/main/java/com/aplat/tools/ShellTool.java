@@ -21,12 +21,15 @@ public final class ShellTool {
     }
 
     public Tool build() {
-        ToolSpec spec = new ToolSpec(
+        // executing(...)：声明"command 这个参数会被当命令跑"——策略层靠它做危险命令检查，
+        // 而不是靠工具名字叫不叫 shell。
+        ToolSpec spec = ToolSpec.executing(
                 "shell",
                 "在隔离沙箱中执行 shell 命令并返回 stdout。工作目录为 /work，无网络。",
                 """
                 {"type":"object","properties":{"command":{"type":"string","description":"要执行的 shell 命令"}},
-                "required":["command"]}""");
+                "required":["command"]}""",
+                "command");
         return Tool.requiringApproval(spec, call -> {
             String command = Json.argString(call.argumentsJson(), "command");
             if (command == null || command.isBlank()) {

@@ -6,3 +6,7 @@ target/
 .vscode/
 .DS_Store
 .env
+
+# 前端（U07a）：依赖与构建产物都不入库
+ui/node_modules/
+ui/dist/

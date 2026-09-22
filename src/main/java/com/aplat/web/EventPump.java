@@ -29,7 +29,22 @@ import java.util.function.Consumer;
  */
 public final class EventPump implements Consumer<SessionEvent> {
 
-    private final SseWriter out;
+    /**
+     * 一条会话事件落到线上的方式。
+     *
+     * <p>做成可替换的，是因为同一个泵要服务两种方言：本平台的信封
+     * （{@code {type, sessionId, seq, payload}}，给内置控制台）与 AG-UI 规范事件
+     * （给 {@code @ag-ui/client} / CopilotKit）。泵本身只管"不漏不重"，
+     * 不管"长什么样"。
+     *
+     * @return false = 写不出去（对端已断开）
+     */
+    @FunctionalInterface
+    public interface EventSink {
+        boolean write(SessionEvent event);
+    }
+
+    private final EventSink sink;
     private final Deque<SessionEvent> buffer = new ArrayDeque<>();
     private long watermark;
     private boolean backfilling;
@@ -39,7 +54,11 @@ public final class EventPump implements Consumer<SessionEvent> {
     };
 
     public EventPump(SseWriter out) {
-        this.out = out;
+        this(event -> out.event(event));
+    }
+
+    public EventPump(EventSink sink) {
+        this.sink = sink;
     }
 
     /** 每成功写出一条事件后回调（锁外）。用于"看到某类事件就收摊"。 */
@@ -106,7 +125,7 @@ public final class EventPump implements Consumer<SessionEvent> {
         if (e.seq() <= watermark) {
             return false; // 已写过（回填与实时的重叠区），不重推
         }
-        if (!out.event(e)) {
+        if (!sink.write(e)) {
             return false;
         }
         watermark = e.seq();

@@ -8,6 +8,7 @@ import com.aplat.sandbox.ProcessSandbox;
 import com.aplat.seam.Hitl;
 import com.aplat.seam.LlmAdapter;
 import com.aplat.seam.Sandbox;
+import com.aplat.tools.DefaultToolPolicy;
 import com.aplat.web.HttpTransport;
 import com.aplat.web.ServerConfig;
 
@@ -54,10 +55,14 @@ public final class Serve {
                         .thenText("已在沙箱中执行命令，输出为 hello-from-http。")
                         .repeat();
 
-        Platform platform = Platform.assemble(llm, sandbox, Hitl.autoAllow(), LoopBudget.defaults());
+        Platform platform = Platform.assemble(llm, sandbox, Hitl.autoAllow(), LoopBudget.defaults(),
+                DefaultToolPolicy.fromEnv());
 
         System.out.println("=== 装配清单 ===");
         System.out.println(platform.assemblyReport());
+        for (String warning : platform.policyWarnings()) {
+            System.out.println("[policy][warn] " + warning);
+        }
         System.out.println("LLM     : " + llm.id() + (realModel ? "（真实服务）" : "（离线脚本）"));
         System.out.println("Sandbox : " + sandbox.description());
 
@@ -68,18 +73,26 @@ public final class Serve {
         System.out.println();
         System.out.println("=== 已启动 " + base + " ===");
         if (config.authEnabled()) {
-            System.out.println("鉴权    : X-API-Key 已启用");
+            System.out.println("鉴权    : X-API-Key 已启用（/health 与 /ui/ 静态资源豁免）");
         } else {
             System.out.println("鉴权    : 未启用（仅监听 " + config.host() + "；对外暴露前请设 APLAT_API_KEY）");
         }
         System.out.println();
-        System.out.println("调试控制台 : " + base + "/");
+        System.out.println("前端会话面 : " + base + "/ui/         ← CopilotKit（U07a）");
+        System.out.println("调试控制台 : " + base + "/            ← 自带的最小控制台");
+        System.out.println("AG-UI 端点 : POST " + base + "/agui/run   ← 前端接的就是它");
+        transport.uiAssetsHint().ifPresent(hint -> System.out.println("[ui][warn] " + hint));
+        System.out.println();
         System.out.println("健康检查   : curl -s " + base + "/health");
         System.out.println("同步跑一次 : curl -s -X POST " + base + "/run \\");
         System.out.println("               -H 'Content-Type: application/json' \\");
         System.out.println("               -d '{\"input\":\"用 shell 打印当前目录\"}'");
-        System.out.println("流式（SSE）: curl -N '" + base + "/agui/stream?input=hello'");
-        System.out.println("续传（无缺无重）: 先记下 lastEventId，再 curl -N '" + base
+        System.out.println("AG-UI 手测 : curl -N -X POST " + base + "/agui/run \\");
+        System.out.println("               -H 'Content-Type: application/json' \\");
+        System.out.println("               -d '{\"threadId\":\"t1\",\"runId\":\"r1\","
+                + "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'");
+        System.out.println("简化流     : curl -N '" + base + "/agui/stream?input=hello'（自带控制台用）");
+        System.out.println("续传       : curl -N '" + base
                 + "/agui/events/<sessionId>?lastEventId=7&once=turn.closed'");
         System.out.println();
         System.out.println("按 Ctrl+C 停止。");

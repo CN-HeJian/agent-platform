@@ -46,7 +46,9 @@ class ToolPipelineTest {
     @DisplayName("3) 危险命令被策略拦截，且拒绝理由可归因")
     void dangerousCommandBlocked() {
         DefaultToolRegistry r = registryWithEcho();
-        r.register(Tool.of(new ToolSpec("shell", "shell", "{}"), call -> ToolResult.ok("should not reach")));
+        // 执行类工具必须声明 commandField，策略层才做得成检查（见 ToolPolicyTest）
+        r.register(Tool.of(ToolSpec.executing("shell", "shell", "{}", "command"),
+                call -> ToolResult.ok("should not reach")));
         ToolPipeline pipeline = new ToolPipeline(r, Hitl.autoAllow());
 
         ToolResult result = pipeline.execute("s1",

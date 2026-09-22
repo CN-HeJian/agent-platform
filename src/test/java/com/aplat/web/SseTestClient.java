@@ -74,6 +74,33 @@ final class SseTestClient {
         }
     }
 
+    /**
+     * POST 一个 JSON 体并读完整条 SSE 流。
+     *
+     * <p>AG-UI 的入口是 {@code POST /agui/run}（{@code EventSource} 只能 GET，
+     * 所以真实前端用的是 fetch + ReadableStream——这里同理）。
+     */
+    static List<Frame> collectPost(String url, String bodyJson, Duration timeout) {
+        ExecutorService exec = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "sse-test-reader");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            Future<List<Frame>> f = exec.submit(() -> readPost(url, bodyJson));
+            return f.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new AssertionError("POST 的 SSE 流未在 " + timeout + " 内结束：" + url, e);
+        } catch (ExecutionException e) {
+            throw new AssertionError("读取 POST SSE 失败：" + url, e.getCause());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("被中断", e);
+        } finally {
+            exec.shutdownNow();
+        }
+    }
+
     /** 打开一条流但不等它结束——用于"断连后资源是否回收"这类测试。 */
     static InputStream open(String url) throws IOException, InterruptedException {
         HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
@@ -89,7 +116,20 @@ final class SseTestClient {
             builder.header(headerName, headerValue);
         }
         HttpResponse<InputStream> resp = client.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream());
+        return parse(resp);
+    }
 
+    private static List<Frame> readPost(String url, String bodyJson) throws IOException, InterruptedException {
+        HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(bodyJson, StandardCharsets.UTF_8))
+                .build();
+        return parse(client.send(req, HttpResponse.BodyHandlers.ofInputStream()));
+    }
+
+    private static List<Frame> parse(HttpResponse<InputStream> resp) throws IOException {
         List<Frame> frames = new ArrayList<>();
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(resp.body(), StandardCharsets.UTF_8))) {

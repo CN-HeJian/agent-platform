@@ -7,6 +7,7 @@ import com.aplat.seam.LlmAdapter;
 import com.aplat.seam.Sandbox;
 import com.aplat.seam.SessionEvent;
 import com.aplat.seam.SessionLog;
+import com.aplat.session.AgUiProjector;
 import com.aplat.tools.Json;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,6 +20,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -61,15 +63,21 @@ public final class HttpTransport implements AutoCloseable {
     private final Platform platform;
     private final ServerConfig config;
     private final ApiKeyGuard guard;
+    private final UiAssets uiAssets;
     private final HttpServer server;
     private final ScheduledExecutorService heartbeat;
     private final Set<SseWriter> activeStreams = ConcurrentHashMap.newKeySet();
     private final long startedAt = System.currentTimeMillis();
 
     public HttpTransport(Platform platform, ServerConfig config) throws IOException {
+        this(platform, config, UiAssets.fromEnv());
+    }
+
+    public HttpTransport(Platform platform, ServerConfig config, UiAssets uiAssets) throws IOException {
         this.platform = platform;
         this.config = config;
         this.guard = new ApiKeyGuard(config.apiKey());
+        this.uiAssets = uiAssets;
         this.server = HttpServer.create(new InetSocketAddress(config.host(), config.port()), 0);
         // 每个请求一条虚拟线程：SSE 处理要长时间阻塞在等事件上，平台线程池会被瞬间占满
         this.server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
@@ -79,6 +87,15 @@ public final class HttpTransport implements AutoCloseable {
             t.setDaemon(true);
             return t;
         });
+    }
+
+    /** 免鉴权的路径：探针与静态资源。API 面一律要 key。 */
+    private static boolean isPublic(String path) {
+        return path.equals("/health")
+                || path.equals("/")
+                || path.equals("/index.html")
+                || path.equals("/ui")
+                || path.startsWith(UiAssets.URL_PREFIX);
     }
 
     public HttpTransport start() {
@@ -99,6 +116,11 @@ public final class HttpTransport implements AutoCloseable {
 
     public ServerConfig config() {
         return config;
+    }
+
+    /** 前端未构建时的提示，供启动日志使用。 */
+    public java.util.Optional<String> uiAssetsHint() {
+        return uiAssets.hintIfMissing();
     }
 
     @Override
@@ -132,17 +154,24 @@ public final class HttpTransport implements AutoCloseable {
                 sendJson(ex, 200, health());
                 return;
             }
-            if (!guard.allowed(ex.getRequestHeaders()::getFirst, query(ex).get("apiKey"))) {
+            if (isPublic(path) && method.equals("GET")) {
+                // 静态资源与探针免鉴权：它们本身不含敏感信息，
+                // 真正的保护在 API 面（需要带 key 的调用）。
+            } else if (!guard.allowed(ex.getRequestHeaders()::getFirst, query(ex).get("apiKey"))) {
                 sendError(ex, 401, "UNAUTHORIZED", "missing or invalid API key");
                 return;
             }
 
             if ((path.equals("/") || path.equals("/index.html")) && method.equals("GET")) {
                 sendConsole(ex);
+            } else if ((path.equals("/ui") || path.startsWith(UiAssets.URL_PREFIX)) && method.equals("GET")) {
+                sendUiAsset(ex, path);
             } else if (path.equals("/kernel") && method.equals("GET")) {
                 sendJson(ex, 200, kernelReport());
             } else if (path.equals("/run") && method.equals("POST")) {
                 handleRun(ex);
+            } else if (path.equals("/agui/run") && method.equals("POST")) {
+                handleAgUiRun(ex);
             } else if (path.equals("/agui/stream") && method.equals("GET")) {
                 handleStream(ex);
             } else if (path.startsWith("/agui/events/") && method.equals("GET")) {
@@ -191,6 +220,95 @@ public final class HttpTransport implements AutoCloseable {
         log("run session=" + sessionId + " input=" + abbreviate(input));
         TurnResult result = platform.loop().run(sessionId, input);
         sendJson(ex, 200, summarise(result));
+    }
+
+    // ------------------------------------------------------- AG-UI 契约面（U08）
+
+    /**
+     * AG-UI 标准端点：{@code POST /agui/run} + SSE。
+     *
+     * <p>这是"对外只讲 AG-UI"的那条线——{@code @ag-ui/client} 的 {@code HttpAgent}、
+     * CopilotKit 都按这个协议说话。与 {@code /agui/stream} 的区别是<b>事件形状</b>：
+     * 那条走本平台信封（{@code {type, sessionId, seq, payload}}），这条走规范字段
+     * （{@code threadId / messageId / delta / toolCallId}）。
+     *
+     * <p>两个协议细节值得说明：
+     * <ul>
+     *   <li><b>不回填历史</b>：客户端自带 thread 历史并负责渲染，服务端重放会让 UI 看到重复消息。
+     *       所以水位直接设在"当前日志末尾"——订阅生效但不补历史。</li>
+     *   <li><b>历史转 LlmMessage 喂给循环</b>：否则多轮对话每轮都从零开始。</li>
+     * </ul>
+     */
+    private void handleAgUiRun(HttpExchange ex) throws IOException {
+        String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        JsonNode root;
+        try {
+            root = MAPPER.readTree(body == null || body.isBlank() ? "{}" : body);
+        } catch (Exception e) {
+            sendError(ex, 400, "INVALID_JSON", "request body must be a RunAgentInput JSON object");
+            return;
+        }
+        AgUiRunInput input = AgUiRunInput.parse(root);
+        if (input.userInput() == null) {
+            sendError(ex, 400, "MISSING_INPUT", "messages must contain a non-empty user message");
+            return;
+        }
+
+        SseWriter writer = null;
+        Subscription subscription = null;
+        try {
+            writer = startSse(ex);
+            activeStreams.add(writer);
+
+            AgUiProjector projector = new AgUiProjector(input.threadId(), input.runId());
+            final SseWriter w = writer;
+            EventPump pump = new EventPump(event -> {
+                boolean first = true;
+                for (Map<String, Object> projected : projector.project(event)) {
+                    String type = String.valueOf(projected.get("type"));
+                    String json = Json.write(projected);
+                    // 同一个内部事件可能产出多条 AG-UI 事件；id 只挂在第一条上，
+                    // 保证 id 唯一且单调——否则 Last-Event-ID 定位会错位
+                    boolean sent = first
+                            ? w.event(event.seq(), type, json)
+                            : w.event(type, json);
+                    first = false;
+                    if (!sent) {
+                        return false;
+                    }
+                }
+                return true;
+            });
+
+            SessionLog log = platform.sessionLog();
+            String sessionId = input.threadId();
+            long resumeFrom = log.events(sessionId).size();
+            subscription = log.subscribe(sessionId, pump);
+            pump.beginBackfill(resumeFrom);
+            pump.goLive();
+
+            log("agui run thread=" + sessionId + " run=" + input.runId()
+                    + " historyTurns=" + input.history().size()
+                    + " input=" + abbreviate(input.userInput()));
+
+            TurnResult result = platform.loop().run(sessionId, input.history(), input.userInput());
+
+            // 收尾：关掉仍然打开的文本消息（否则前端的光标会一直闪）
+            for (Map<String, Object> projected : projector.finish()) {
+                w.event(String.valueOf(projected.get("type")), Json.write(projected));
+            }
+            log("agui run done thread=" + sessionId + " status=" + result.status());
+        } catch (Exception e) {
+            if (writer != null) {
+                writer.event("RUN_ERROR", Json.write(Map.of(
+                        "type", "RUN_ERROR",
+                        "message", String.valueOf(e.getMessage()),
+                        "code", "TRANSPORT_ERROR")));
+            }
+            log("agui run failed: " + e);
+        } finally {
+            release(subscription, writer, ex, "run finished");
+        }
     }
 
     // ------------------------------------------------------------- SSE 流式面
@@ -308,8 +426,7 @@ public final class HttpTransport implements AutoCloseable {
         return sub;
     }
 
-    private SseWriter startSse(HttpExchange ex) throws IOException {
-        Headers h = ex.getResponseHeaders();
+    private SseWriter startSse(HttpExchange ex) throws IOException {        Headers h = ex.getResponseHeaders();
         h.set("Content-Type", "text/event-stream; charset=utf-8");
         h.set("Cache-Control", "no-cache, no-transform");
         h.set("Connection", "keep-alive");
@@ -353,6 +470,7 @@ public final class HttpTransport implements AutoCloseable {
         out.put("seams", platform.kernel().registry().boundSeams().size());
         out.put("activeStreams", activeStreams.size());
         out.put("auth", guard.enabled() ? "api-key" : "disabled(loopback only)");
+        out.put("ui", uiAssets.available() ? "built" : "not built (run: cd ui && npm run build)");
         return out;
     }
 
@@ -373,6 +491,23 @@ public final class HttpTransport implements AutoCloseable {
         out.put("finalText", r.finalText());
         out.put("events", r.events().size());
         return out;
+    }
+
+    /** 托管前端构建产物（{@code ui/dist}）。路径穿越与 SPA 回退都在 {@link UiAssets} 里处理。 */
+    private void sendUiAsset(HttpExchange ex, String path) throws IOException {
+        if (!uiAssets.available()) {
+            sendError(ex, 404, "UI_NOT_BUILT",
+                    uiAssets.hintIfMissing().orElse("ui/dist not found"));
+            return;
+        }
+        Path file = uiAssets.resolve(path);
+        if (file == null) {
+            sendError(ex, 404, "NOT_FOUND", "no such asset: " + path);
+            return;
+        }
+        // 本地开发工具：宁可每次都重新取，也不要发到一半发现是上一版前端
+        ex.getResponseHeaders().set("Cache-Control", "no-store");
+        sendBytes(ex, 200, UiAssets.contentTypeOf(file), uiAssets.read(file));
     }
 
     private void sendConsole(HttpExchange ex) throws IOException {

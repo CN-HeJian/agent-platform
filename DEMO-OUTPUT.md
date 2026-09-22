@@ -232,3 +232,129 @@ count = 11
 3. **两次 `POST /run` 都成功**：`ScriptedLlmAdapter` 默认脚本用尽即吐 `[script exhausted]`，
    服务版加了 `repeat()`——服务是要被反复戳的，不该第二次请求就失效。
 
+---
+
+# U15 + U08 + U07a 真实运行记录
+
+## 单元测试
+
+```
+Tests run: 129, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+新增 / 变化：`ToolPolicyTest`(12) · `UiAssetsTest`(9) · `AgUiProjectorTest`(15) · `AgUiRunEndpointTest`(10)。
+
+## AG-UI 规范端点（U08）：`POST /agui/run` 的真实字节
+
+```
+$ curl -sN -X POST http://127.0.0.1:8787/agui/run -H 'Content-Type: application/json' \
+       -d '{"threadId":"t-demo","runId":"r-demo","messages":[{"role":"user","content":"帮我跑一条命令"}]}'
+
+id: 2
+event: RUN_STARTED
+data: {"type":"RUN_STARTED","threadId":"t-demo","runId":"r-demo"}
+
+id: 4
+event: STEP_STARTED
+data: {"type":"STEP_STARTED","stepName":"step-1"}
+
+id: 5
+event: TOOL_CALL_START
+data: {"type":"TOOL_CALL_START","toolCallId":"call_fa0e6c86","toolCallName":"shell"}
+
+event: TOOL_CALL_ARGS
+data: {"type":"TOOL_CALL_ARGS","toolCallId":"call_fa0e6c86","delta":"{\"command\":\"echo hello-from-http\"}"}
+
+id: 6
+event: TOOL_CALL_END
+data: {"type":"TOOL_CALL_END","toolCallId":"call_fa0e6c86"}
+
+event: TOOL_CALL_RESULT
+data: {"type":"TOOL_CALL_RESULT","messageId":"toolmsg-6","toolCallId":"call_fa0e6c86","role":"tool","content":"hello-from-http\n"}
+
+id: 7
+event: STATE_SNAPSHOT
+data: {"type":"STATE_SNAPSHOT","snapshot":{"messages":"4","step":"1"}}
+
+id: 9
+event: STEP_FINISHED
+data: {"type":"STEP_FINISHED","stepName":"step-1"}
+
+event: STEP_STARTED
+data: {"type":"STEP_STARTED","stepName":"step-2"}
+
+id: 10
+event: TEXT_MESSAGE_START
+data: {"type":"TEXT_MESSAGE_START","messageId":"msg-10","role":"assistant"}
+
+event: TEXT_MESSAGE_CONTENT
+data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"msg-10","delta":"已在沙箱中执行命令，输出为 hello-from-http。"}
+
+id: 11
+event: TEXT_MESSAGE_END
+data: {"type":"TEXT_MESSAGE_END","messageId":"msg-10"}
+
+event: STEP_FINISHED
+data: {"type":"STEP_FINISHED","stepName":"step-2"}
+
+event: RUN_FINISHED
+data: {"type":"RUN_FINISHED","threadId":"t-demo","runId":"r-demo"}
+```
+
+`id:` 只挂在"一条内部事件产出的第一条 AG-UI 事件"上 —— 所以 id 唯一且递增
+（2,4,5,6,7,9,10,11），续传断点不会错位。
+
+## 前端聊天面（U07a）：真浏览器里跑通
+
+无头 Chrome（CDP 驱动）真的输入并发送一条消息，页面文本：
+
+```
+输入结果 : "SENT"
+--- 页面文本 ---
+agent-platform · 会话
+CopilotKit 聊天面 · AG-UI 直连 http://127.0.0.1:8787/agui/run
+健康检查 / 装配清单 / 调试控制台
+说点什么试试。离线模式下后端用的是脚本化模型，所以回复是固定剧本；…
+用 shell 打印当前目录                     ← 用户消息
+已在沙箱中执行命令，输出为 hello-from-http。   ← 助手回复（流式抵达）
+Powered by CopilotKit
+```
+
+服务端同期日志：
+
+```
+[web] agui run thread=580bebc9-0b37-4da8-aa39-8ff5200c64fb run=f30c4cbf-… historyTurns=0 input=用 shell 打印当前目录
+[web] agui run done thread=580bebc9-0b37-4da8-aa39-8ff5200c64fb status=COMPLETED
+```
+
+截图见 `docs/screenshots/ui-01-initial.png` 与 `ui-02-chat-roundtrip.png`。
+
+## 这一段最值钱的发现：靠真客户端才暴露的协议 bug
+
+第一次用真浏览器跑，**服务端显示 `status=COMPLETED`，前端却报错**：
+
+```
+Cannot send 'RUN_FINISHED' while steps are still active: step-1, step-2
+```
+
+原因：AG-UI 客户端会校验生命周期——每个 `STEP_STARTED` 必须有配对的 `STEP_FINISHED`，
+我原先**只发前者不发后者**（当时以为它是可选的）。
+
+三点值得记住：
+
+1. **单测当时是"绿"的**。我写的 13 个投影用例全过——因为它们只断言了我认为对的序列，
+   而"我认为对的"本身就是错的。**用自己的假设去测自己的假设，测不出协议理解错误。**
+2. **真客户端一次就抓出来了**。这就是为什么"接一个真实前端"不能只做静态截图验收。
+3. 修完之后补了 `stepLifecycleIsBalanced` / `streamSatisfiesClientLifecycleChecks`
+   两条回归用例，把"配平"变成可执行断言。
+
+## 还有一个诚实的缺口（未做，属 U07b）
+
+AG-UI 事件里 `TOOL_CALL_*` 四件套**都发对了**（有测试钉住，上面 curl 也能看到），
+但**界面上看不到工具卡片**：CopilotKit 默认不知道该怎么画一个工具调用，需要在 React 侧
+注册 `renderToolCalls`。现在只能读到工具的**文字结果**（"输出为 hello-from-http"）。
+
+这不是后端问题，也不是配置错了，而是 U07b（自研定制）本该做的事。
+
+

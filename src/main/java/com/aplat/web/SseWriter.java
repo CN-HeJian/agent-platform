@@ -43,6 +43,17 @@ public final class SseWriter {
         return frame(e.seq(), AgUiMapper.agUiType(e.type()), Json.write(AgUiMapper.toAgUi(e)));
     }
 
+    /**
+     * 写一条**已是 AG-UI 规范形状**的事件（{@code data} 就是规范 JSON 本身）。
+     *
+     * <p>与 {@link #event(SessionEvent)} 的区别：那条走的是本平台的信封
+     * （{@code {type, sessionId, seq, payload}}），这条是给 {@code @ag-ui/client} /
+     * CopilotKit 消费的标准事件。仍然带上 {@code id:}，让我们的断线续传也适用。
+     */
+    public boolean event(long id, String agUiType, String specJson) {
+        return frame(id, agUiType, specJson);
+    }
+
     /** 写一条自定义事件（回执、诊断），没有 seq 就不带 id。 */
     public boolean event(String type, String dataJson) {
         return frame(null, type, dataJson);

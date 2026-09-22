@@ -57,11 +57,28 @@ public final class AgentLoop {
     }
 
     public TurnResult run(String sessionId, String userInput) {
+        return run(sessionId, List.of(), userInput);
+    }
+
+    /**
+     * 带历史的 run：多轮对话时把之前的轮次作为上下文喂进去。
+     *
+     * <p>没有这个重载，每次 run 都从 {@code [system, user]} 开始，模型完全不知道
+     * 上一句说了什么——前端看起来就是"它失忆了"。
+     *
+     * <p>谁是历史的持有者？**AG-UI 里是客户端**（每次 run 把完整 messages 发过来），
+     * 我们照此照办，而不是从会话日志里回放——否则同一段历史会被推给前端两次。
+     *
+     * @param history 之前的 user/assistant 轮次；不含本轮输入，也不含 system
+     */
+    public TurnResult run(String sessionId, List<LlmMessage> history, String userInput) {
         List<LlmMessage> messages = new ArrayList<>();
         messages.add(LlmMessage.system(systemPrompt));
+        messages.addAll(history);
         messages.add(LlmMessage.user(userInput));
 
-        log.append(sessionId, SessionLog.EV_INPUT, Map.of("text", userInput));
+        log.append(sessionId, SessionLog.EV_INPUT,
+                Map.of("text", userInput, "historyTurns", history.size()));
         log.append(sessionId, SessionLog.EV_TURN_START, Map.of("input", userInput));
 
         String finalText = null;

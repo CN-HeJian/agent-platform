@@ -13,9 +13,12 @@ import com.aplat.seam.Store;
 import com.aplat.seam.ToolRegistry;
 import com.aplat.store.InMemoryStore;
 import com.aplat.tools.BuiltinTools;
+import com.aplat.tools.DefaultToolPolicy;
 import com.aplat.tools.DefaultToolRegistry;
 import com.aplat.tools.ShellTool;
 import com.aplat.tools.ToolPipeline;
+import com.aplat.tools.ToolPolicy;
+import java.util.List;
 
 /**
  * 装配根（composition root）。
@@ -37,18 +40,33 @@ public final class Platform {
     private final Kernel kernel;
     private final AgentLoop loop;
     private final SessionLog sessionLog;
+    private final List<String> policyWarnings;
 
-    private Platform(Kernel kernel, AgentLoop loop, SessionLog sessionLog) {
+    private Platform(Kernel kernel, AgentLoop loop, SessionLog sessionLog, List<String> policyWarnings) {
         this.kernel = kernel;
         this.loop = loop;
         this.sessionLog = sessionLog;
+        this.policyWarnings = List.copyOf(policyWarnings);
     }
 
     /** 标准装配：给定模型与沙箱，其余用默认实现补齐。 */
     public static Platform assemble(LlmAdapter llm, Sandbox sandbox, Hitl hitl, LoopBudget budget) {
+        return assemble(llm, sandbox, hitl, budget, DefaultToolPolicy.defaults());
+    }
+
+    /**
+     * 带策略的装配。
+     *
+     * <p>装配期会跑一次 {@link DefaultToolPolicy#lint}——把"名字像执行类、却没声明 commandField"
+     * 的工具报出来。这是对"忘了声明"的唯一可靠兜底：运行时不猜，启动时喊。
+     */
+    public static Platform assemble(LlmAdapter llm, Sandbox sandbox, Hitl hitl, LoopBudget budget,
+                                    ToolPolicy policy) {
         ToolRegistry tools = new DefaultToolRegistry();
         BuiltinTools.registerAll(tools);
         tools.register(new ShellTool(sandbox).build());
+
+        List<String> warnings = DefaultToolPolicy.lint(tools);
 
         Kernel kernel = Kernel.builder()
                 .bind(Store.class, new InMemoryStore())
@@ -62,14 +80,19 @@ public final class Platform {
 
         AgentLoop loop = new AgentLoop(
                 kernel.ctx().get(LlmAdapter.class),
-                new ToolPipeline(tools, hitl),
+                new ToolPipeline(tools, hitl, policy),
                 kernel.ctx().get(ContextProvider.class),
                 kernel.ctx().get(SessionLog.class),
                 kernel.bus(),
                 budget,
                 DEFAULT_SYSTEM_PROMPT);
 
-        return new Platform(kernel, loop, kernel.ctx().get(SessionLog.class));
+        return new Platform(kernel, loop, kernel.ctx().get(SessionLog.class), warnings);
+    }
+
+    /** 装配期发现的安全隐患（空列表 = 干净）。启动时应当打出来。 */
+    public List<String> policyWarnings() {
+        return policyWarnings;
     }
 
     public AgentLoop loop() {
