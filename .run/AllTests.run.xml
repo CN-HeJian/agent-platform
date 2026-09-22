@@ -1,0 +1,10 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="全部测试" type="JUnit" factoryName="JUnit">
+    <option name="TEST_OBJECT" value="package" />
+    <option name="PACKAGE_NAME" value="com.aplat" />
+    <module name="agent-platform" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>
