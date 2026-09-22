@@ -25,10 +25,23 @@ public final class ScriptedLlmAdapter implements LlmAdapter {
     }
 
     private final Deque<Step> script = new ArrayDeque<>();
+    private final List<Step> repeatable = new ArrayList<>();
     private final List<LlmRequest> received = new ArrayList<>();
     private final List<String> stepLabels = new ArrayList<>();
+    private boolean repeating;
 
     public ScriptedLlmAdapter() {
+    }
+
+    /**
+     * 脚本用尽后从头再来。
+     *
+     * <p>只给"长期驻留的离线演示"用（{@code Serve}）：服务要能被反复戳，
+     * 而单次跑完的用例需要"脚本用尽"这个明确信号，所以默认不开。
+     */
+    public ScriptedLlmAdapter repeat() {
+        this.repeating = true;
+        return this;
     }
 
     /** 追加一步：输出纯文本并收口。 */
@@ -47,7 +60,9 @@ public final class ScriptedLlmAdapter implements LlmAdapter {
 
     /** 追加一步：自定义行为（可以拿到请求做断言或动态决策）。 */
     public ScriptedLlmAdapter then(String label, Step step) {
-        script.addLast(new LabelledStep(label, step));
+        Step labelled = new LabelledStep(label, step);
+        script.addLast(labelled);
+        repeatable.add(labelled);
         stepLabels.add(label);
         return this;
     }
@@ -69,6 +84,10 @@ public final class ScriptedLlmAdapter implements LlmAdapter {
     public void stream(LlmRequest request, Consumer<LlmChunk> sink) {
         received.add(request);
         Step next = script.pollFirst();
+        if (next == null && repeating && !repeatable.isEmpty()) {
+            script.addAll(repeatable);
+            next = script.pollFirst();
+        }
         if (next == null) {
             // 脚本用尽：不要抛异常（那会让"预算终止"这类测试失真），给一个显式收口
             sink.accept(new LlmChunk.TextDelta("[script exhausted]"));
@@ -80,9 +99,9 @@ public final class ScriptedLlmAdapter implements LlmAdapter {
         }
     }
 
-    /** 已消费到的步标号，便于断言"跑了几步"。 */
+    /** 已消费到的步标号，便于断言"跑了几步"。循环模式下只到标号表末尾。 */
     public List<String> consumed() {
-        return new ArrayList<>(stepLabels.subList(0, received.size()));
+        return new ArrayList<>(stepLabels.subList(0, Math.min(received.size(), stepLabels.size())));
     }
 
     /** 每次 stream 收到的请求快照。 */

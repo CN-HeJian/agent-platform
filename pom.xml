@@ -49,9 +49,28 @@
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
         <version>3.2.0</version>
+        <!--
+          注意：<configuration> 里显式写死 mainClass 时，-Dexec.mainClass= 会被忽略
+          （配置优先级高于用户属性）。所以要跑 Serve 必须用 execution 的 id：
+              ./mvnw -q compile exec:java@serve
+        -->
         <configuration>
           <mainClass>com.aplat.run.Demo</mainClass>
         </configuration>
+        <executions>
+          <execution>
+            <id>demo</id>
+            <configuration>
+              <mainClass>com.aplat.run.Demo</mainClass>
+            </configuration>
+          </execution>
+          <execution>
+            <id>serve</id>
+            <configuration>
+              <mainClass>com.aplat.run.Serve</mainClass>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>

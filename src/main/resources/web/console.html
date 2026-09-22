@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-platform · 调试控制台</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --line:#e3e6ea; --ink:#1b1f24; --dim:#6b7280;
+    --accent:#2f6fed; --ok:#1a7f4b; --warn:#b45309; --err:#c0392b; --tool:#7c3aed;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:12px 18px;background:var(--panel);
+         border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  header h1{font-size:15px;margin:0;font-weight:600}
+  header .meta{color:var(--dim);font-size:12px;margin-left:auto;display:flex;gap:10px;align-items:center}
+  .dot{width:8px;height:8px;border-radius:50%;background:#c3c8cf;display:inline-block}
+  .dot.on{background:var(--ok)} .dot.off{background:var(--err)}
+  main{max-width:920px;margin:0 auto;padding:18px}
+  .bar{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+  input,button,select{font:inherit;border-radius:8px;border:1px solid var(--line);
+        background:var(--panel);padding:8px 10px;color:inherit}
+  #say{flex:1;min-width:240px}
+  button{cursor:pointer;background:var(--accent);color:#fff;border-color:var(--accent);font-weight:500}
+  button.ghost{background:var(--panel);color:var(--ink);border-color:var(--line);font-weight:400}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .turn{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        padding:14px 16px;margin-bottom:14px}
+  .turn .q{font-weight:600;margin-bottom:10px}
+  .turn .q small{color:var(--dim);font-weight:400;margin-left:8px;font-family:ui-monospace,Menlo,monospace}
+  .answer{white-space:pre-wrap;word-break:break-word}
+  .caret{display:inline-block;width:7px;height:15px;background:var(--accent);
+         vertical-align:-2px;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .tool{border-left:3px solid var(--tool);background:#faf8ff;border-radius:0 8px 8px 0;
+        padding:8px 12px;margin:8px 0;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+  .tool .name{color:var(--tool);font-weight:600}
+  .tool .res{color:var(--dim);margin-top:4px;white-space:pre-wrap}
+  .tool.err{border-left-color:var(--err);background:#fff6f5}
+  .steps{color:var(--dim);font-size:12px;margin-top:10px;display:flex;gap:14px;flex-wrap:wrap}
+  .pill{padding:1px 8px;border-radius:999px;background:#eef1f5;font-size:12px}
+  .pill.ok{background:#e8f5ee;color:var(--ok)}
+  .pill.err{background:#fdecea;color:var(--err)}
+  .pill.warn{background:#fdf3e3;color:var(--warn)}
+  details{margin-top:10px}
+  details summary{cursor:pointer;color:var(--dim);font-size:12.5px}
+  pre{background:#0f1115;color:#d7dae0;padding:10px 12px;border-radius:8px;overflow:auto;
+      font-size:12px;max-height:280px;margin:8px 0 0}
+  .hint{color:var(--dim);font-size:12.5px;margin-top:6px}
+  label.opt{display:flex;gap:6px;align-items:center;color:var(--dim);font-size:12.5px}
+</style>
+</head>
+<body>
+<header>
+  <h1>agent-platform · 调试控制台</h1>
+  <span class="hint">这不是 U07 的正式前端，只是用来肉眼确认 SSE 链路</span>
+  <div class="meta">
+    <span><span id="healthDot" class="dot"></span> <span id="healthTxt">…</span></span>
+    <span id="llmTxt"></span>
+  </div>
+</header>
+
+<main>
+  <div class="bar">
+    <input id="say" placeholder="说点什么，例如：用 shell 打印当前目录" autocomplete="off">
+    <button id="send">发送</button>
+    <button id="stop" class="ghost" disabled>中断</button>
+    <label class="opt"><input type="checkbox" id="reuse"> 复用会话</label>
+    <input id="key" placeholder="API Key（可选）" style="width:170px" autocomplete="off">
+  </div>
+  <div class="hint" id="sidLine">会话：—</div>
+  <div id="log" style="margin-top:14px"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let sessionId = null;
+let es = null;
+let current = null;      // 当前 turn 的 DOM 句柄
+let toolCards = new Map();
+
+// ---- 健康检查：一眼看出服务是否活着、用的是哪个模型/沙箱
+async function health(){
+  try{
+    const r = await fetch('/health');
+    const j = await r.json();
+    $('healthDot').className = 'dot on';
+    $('healthTxt').textContent = 'ok · ' + j.auth;
+    $('llmTxt').textContent = j.llm + ' · ' + j.sandbox;
+  }catch(e){
+    $('healthDot').className = 'dot off';
+    $('healthTxt').textContent = '不可达';
+  }
+}
+health(); setInterval(health, 10000);
+
+function newTurn(input, sid){
+  const el = document.createElement('div');
+  el.className = 'turn';
+  el.innerHTML = '<div class="q"></div><div class="body"></div><div class="steps"></div><details><summary>过程时间线</summary><pre></pre></details>';
+  el.querySelector('.q').innerHTML = escapeHtml(input) + '<small>' + sid + '</small>';
+  $('log').prepend(el);
+  return {
+    el,
+    body: el.querySelector('.body'),
+    steps: el.querySelector('.steps'),
+    raw: el.querySelector('pre'),
+    text: '', stepsUsed: 0, toolCount: 0, open: true
+  };
+}
+
+function appendText(t){
+  if(!current) return;
+  current.text += t;
+  current.body.textContent = current.text;
+  const caret = document.createElement('span');
+  caret.className = 'caret';
+  current.body.appendChild(caret);
+}
+
+function addTool(payload, phase){
+  if(!current) return;
+  const id = payload.id || ('t' + current.toolCount);
+  let card = toolCards.get(id);
+  if(phase === 'start'){
+    card = document.createElement('div');
+    card.className = 'tool';
+    card.innerHTML = '<div class="name"></div><div class="res">执行中…</div>';
+    card.querySelector('.name').textContent = payload.tool + ' ' + (payload.args || '');
+    current.body.appendChild(card);
+    toolCards.set(id, card);
+    current.toolCount++;
+  } else if(card){
+    const ok = payload.ok !== false && !payload.errorCode;
+    card.classList.toggle('err', !ok);
+    card.querySelector('.res').textContent =
+      (ok ? '' : 'ERROR[' + payload.errorCode + '] ') + (payload.content ?? '');
+  }
+}
+
+function finish(payload, status){
+  if(!current) return;
+  const caret = current.body.querySelector('.caret');
+  if(caret) caret.remove();
+  const pill = document.createElement('span');
+  const cls = status === 'COMPLETED' ? 'ok' : (status === 'ERROR' ? 'err' : 'warn');
+  pill.className = 'pill ' + cls;
+  pill.textContent = status + ' · ' + current.stepsUsed + ' step · ' + current.toolCount + ' tool';
+  current.steps.appendChild(pill);
+  current.open = false;
+}
+
+function send(){
+  const input = $('say').value.trim();
+  if(!input) return;
+  if(!sessionId || !$('reuse').checked) sessionId = 's-' + Math.random().toString(36).slice(2,10);
+  $('sidLine').textContent = '会话：' + sessionId;
+  $('say').value = '';
+  current = newTurn(input, sessionId);
+  toolCards = new Map();
+
+  const key = $('key').value.trim();
+  const url = '/agui/stream?input=' + encodeURIComponent(input)
+            + '&sessionId=' + encodeURIComponent(sessionId)
+            + (key ? '&apiKey=' + encodeURIComponent(key) : '');
+
+  es = new EventSource(url);
+  $('send').disabled = true; $('stop').disabled = false;
+
+  es.onmessage = (e) => handle(JSON.parse(e.data), 'MESSAGE');
+  // AG-UI 事件名就是 SSE 的 event 名，这里逐类挂上——前端可依赖的事件序列就这几条
+  ['RUN_STARTED','STEP_STARTED','TEXT_MESSAGE_CONTENT','TOOL_CALL_START','TOOL_CALL_END',
+   'STATE_SNAPSHOT','RUN_FINISHED','RUN_ERROR','RUN_REQUESTED','RUN_RESULT']
+    .forEach(t => es.addEventListener(t, (e) => handle(JSON.parse(e.data), t)));
+
+  es.onerror = () => { finish({}, 'DISCONNECTED'); close(); };
+}
+
+function handle(payload, type){
+  if(!current) return;
+  current.raw.textContent += '@' + (payload.seq ?? '-') + ' ' + (payload.type || type)
+      + ' ' + JSON.stringify(payload.payload ?? payload) + '\n';
+  switch(type){
+    case 'STEP_STARTED':
+      current.stepsUsed = Math.max(current.stepsUsed, payload.payload?.step ?? current.stepsUsed);
+      break;
+    case 'TEXT_MESSAGE_CONTENT':
+      if(payload.payload?.text !== undefined) appendText(payload.payload.text);
+      break;
+    case 'TOOL_CALL_START': addTool(payload.payload || {}, 'start'); break;
+    case 'TOOL_CALL_END':   addTool(payload.payload || {}, 'end');   break;
+    case 'RUN_FINISHED':    finish(payload.payload || {}, 'COMPLETED'); close(); break;
+    case 'RUN_ERROR':       finish(payload.payload || {}, 'ERROR');     close(); break;
+    case 'RUN_RESULT':      finish(payload, payload.status || 'COMPLETED'); break;
+  }
+}
+
+function close(){
+  if(es){ es.close(); es = null; }
+  $('send').disabled = false; $('stop').disabled = true;
+}
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+$('send').onclick = send;
+$('stop').onclick = () => { if(current) finish({}, 'ABORTED'); close(); };
+$('say').addEventListener('keydown', e => { if(e.key === 'Enter') send(); });
+</script>
+</body>
+</html>
