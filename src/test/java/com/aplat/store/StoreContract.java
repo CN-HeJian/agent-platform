@@ -122,6 +122,18 @@ abstract class StoreContract {
     }
 
     @Test
+    @DisplayName("能列出出现过的会话，去重且有序——没有它，指标与运营台无从下手")
+    void sessionIdsAreEnumerable() {
+        append("s-b", "a");
+        append("s-a", "a");
+        append("s-a", "b");
+        assertEquals(List.of("s-a", "s-b"), store().sessionIds(),
+                "同一个会话只出现一次，且按字典序（与 JDBC 的 ORDER BY 一致）");
+        reset();
+        assertTrue(store().sessionIds().isEmpty(), "清空后不该还记得任何会话");
+    }
+
+    @Test
     @DisplayName("幂等键：首次见到为 true，重复为 false")
     void idempotencyKeySemantics() {
         assertTrue(store().markIfAbsent("k1", "ref-1"));

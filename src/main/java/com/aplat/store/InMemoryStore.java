@@ -38,6 +38,15 @@ public final class InMemoryStore implements Store {
     }
 
     @Override
+    public synchronized List<String> sessionIds() {
+        // 排序与 JDBC 实现保持一致（那边是 ORDER BY）。契约说排序就必须两个都排——
+        // 否则"同一个断言在内存上过、在 MySQL 上挂"，而这正是契约测试要消灭的东西。
+        java.util.List<String> out = new java.util.ArrayList<>(events.keySet());
+        java.util.Collections.sort(out);
+        return out;
+    }
+
+    @Override
     public synchronized List<SessionEvent> events(String sessionId, long afterSeq) {
         List<SessionEvent> all = events.getOrDefault(sessionId, List.of());
         List<SessionEvent> out = new ArrayList<>();

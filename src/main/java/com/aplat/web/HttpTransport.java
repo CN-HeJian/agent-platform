@@ -2,6 +2,10 @@ package com.aplat.web;
 
 import com.aplat.hitl.InteractiveHitl;
 import com.aplat.hitl.ScopedHitl;
+import com.aplat.observe.JsonLog;
+import com.aplat.observe.Metrics;
+import com.aplat.observe.TraceBuilder;
+import com.aplat.observe.TraceJson;
 import com.aplat.hitl.PendingApproval;
 import com.aplat.kernel.Subscription;
 import com.aplat.loop.TurnResult;
@@ -218,6 +222,10 @@ public final class HttpTransport implements AutoCloseable {
                 sendUiAsset(ex, path);
             } else if (path.equals("/kernel") && method.equals("GET")) {
                 sendJson(ex, 200, kernelReport());
+            } else if (path.equals("/metrics") && method.equals("GET")) {
+                sendMetrics(ex, query(ex));
+            } else if (path.startsWith("/trace/") && method.equals("GET")) {
+                handleTrace(ex, path.substring("/trace/".length()));
             } else if (path.equals("/tools") && method.equals("GET")) {
                 sendJson(ex, 200, toolsReport());
             } else if (path.equals("/audit") && method.equals("GET")) {
@@ -646,6 +654,43 @@ public final class HttpTransport implements AutoCloseable {
      * <p>这是"人在另一个设备上"也能用的关键：{@code POST /run} 在等确认时会一直挂在那儿，
      * 而任何一方都可以用它看到"现在有几条在等人、分别是什么"，再决定放不放。
      */
+    // ---------------------------------------------------------- U23 可观测面
+
+    /** {@code /metrics}：默认 JSON；{@code ?format=prometheus} 出采集器认的文本。 */
+    private void sendMetrics(HttpExchange ex, Map<String, String> q) throws IOException {
+        Metrics metrics = new Metrics(platform.store(), platform.sessionLog());
+        String format = q.get("format");
+        if ("prometheus".equalsIgnoreCase(format) || "text".equalsIgnoreCase(format)) {
+            sendBytes(ex, 200, "text/plain; version=0.0.4; charset=utf-8",
+                    metrics.prometheus().getBytes(StandardCharsets.UTF_8));
+            return;
+        }
+        sendJson(ex, 200, metrics.snapshot());
+    }
+
+    /**
+     * {@code /trace/{sessionId}}：把事件流投影成 span 树。
+     *
+     * <p>投影是**只读**且**随时可做**的：不需要"当时开了追踪"。于是排查一个三天前的
+     * 坏会话，和查刚刚失败的那次，用的是同一个接口。
+     */
+    private void handleTrace(HttpExchange ex, String rawSessionId) throws IOException {
+        String sessionId = URLDecoder.decode(rawSessionId, StandardCharsets.UTF_8);
+        if (sessionId.isBlank()) {
+            sendError(ex, 400, "MISSING_SESSION_ID", "session id is required in path");
+            return;
+        }
+        var trace = TraceBuilder.build(platform.sessionLog(), sessionId);
+        if (trace.events().isEmpty()) {
+            sendError(ex, 404, "NO_SUCH_SESSION", "no events recorded for session " + sessionId);
+            return;
+        }
+        Map<String, Object> body = TraceJson.view(trace);
+        // 未结束的 span 一并说清"这意味着什么"，免得看到半个 step 的人以为是采集漏了
+        body.put("openSpansNote", "ended=false 的 span 没有结束事件：崩在某一步、或者还在跑");
+        sendJson(ex, 200, body);
+    }
+
     // ------------------------------------------------------ U19/U22 任务与调度面
 
     /** 任务列表。默认只看未结束的：`?all=1` 看全部。 */
@@ -1132,7 +1177,10 @@ public final class HttpTransport implements AutoCloseable {
         return s.length() <= 60 ? s : s.substring(0, 60) + "...";
     }
 
+    /** 服务日志。给机器看的就一条 JSON，不要人话版——两种混在一起时两种都不好用。 */
+    private static final JsonLog SERVICE_LOG = JsonLog.of("web");
+
     private static void log(String msg) {
-        System.out.println("[web] " + msg);
+        SERVICE_LOG.warn(msg, Map.of());
     }
 }

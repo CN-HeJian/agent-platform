@@ -28,6 +28,9 @@
 | **副作用幂等（U21）** | `durable/StoreIdempotency` | ✅ 三种崩点分别可验证；结果未知时**不重跑** |
 | **调度（U22）** | `schedule/`（trigger + scheduler） | ✅ 一次性/间隔/每日定点；错过不补跑；双发防护 |
 | **提前批准（U22）** | `hitl/ScopedHitl` | ✅ 逐条调度、逐个工具名授权，只在该调度线程上生效 |
+| **追踪（U23）** | `observe/TraceBuilder` + `GET /trace/{sid}` | ✅ span 树从事件流**投影**；崩溃的会话也有完整一棵 |
+| **指标（U23）** | `observe/Metrics` + `GET /metrics` | ✅ JSON 与 Prometheus 两种；重启后不清零 |
+| **结构化日志（U23）** | `observe/JsonLog` | ✅ 服务日志一行一条 JSON（业务事件另走事件流） |
 | 装配根 | `run/Platform` | ✅ |
 | **HTTP + SSE 传输层（U02）** | `web/` | ✅ 零新增依赖（JDK HttpServer + 虚拟线程） |
 | **AG-UI 规范端点（U08）** | `session/AgUiProjector` + `POST /agui/run` | ✅ 事件形状符合规范，客户端可直连 |
@@ -39,8 +42,8 @@
 | **工具卡片 + 过程时间线（U07b）** | `ui/src/ToolCard.tsx` · `ui/src/Timeline.tsx` | ✅ 工具参数/结果可视化；原始事件实时可见 |
 | **人工确认 HITL（U12/U13）** | `hitl/InteractiveHitl` + `ui/src/ApprovalPanel.tsx` | ✅ once / always / deny / modify / timeout 五条路径，全程留痕 |
 
-**尚未做**（按计划属后续需求单元）：可观测台（U23）、MCP 接入（U24）、
-RBAC 与密钥（U25）、容器化（U26）、评测飞轮（U27/U28）、平台化（U29–U33）。
+**尚未做**（按计划属后续需求单元）：MCP 接入（U24）、RBAC 与密钥（U25）、
+容器化（U26）、评测飞轮（U27/U28）、平台化（U29–U33）。
 
 ---
 
@@ -290,6 +293,26 @@ export APLAT_DB_URL='jdbc:mysql://127.0.0.1:3307/aplat' APLAT_DB_USER=root APLAT
 
 注意它**拒绝在内存 Store 下运行**：跨进程验证的前提是两个进程看到同一份状态，
 内存实现下这个演示会"成功"但什么也没证明。
+
+### 可观测：追踪是投影出来的（U23）
+
+`GET /trace/{sessionId}` 把事件流**投影**成 span 树；`GET /metrics` 出 JSON，
+`?format=prometheus` 出采集器认的文本。
+
+两条设计决定值得写下来：
+
+**不埋点，做投影。** 另一种做法是在执行路径上埋 `span.start()/end()`，那样**崩溃的会话
+会丢掉最后一个 span** —— 进程都没了，谁来调 `end()`？而"崩掉的那一次"恰恰是最需要看追踪的
+那一次。投影方案里，那个没有结束事件的 span 本身就是答案：它指出崩在了哪一步。
+（`ended=false` 与推断出来的 `endInferred=true` 是两个不同的标记，"事实"与"推断"在
+输出里必须能区分。）
+
+**不做进程内计数器。** `AtomicLong` 在重启后清零，多实例时每个副本只看到自己那一份，
+而"今天工具调用 1200 次"这种数字看起来总是可信的——那比没有指标更糟。
+指标全部从事件流与任务表聚合：重启后照旧、多副本天然合并、且指标与日志说的是同一件事。
+
+`Store` 为此长了一个方法 `sessionIds()`。在它之前，"现在有哪些会话"没法回答——
+调用方得先知道 id，于是全量统计根本无从下手。**一个只能按已知键查询的存储，做不出运维面。**
 
 ### 调度与"半夜没人点批准"（U22）
 

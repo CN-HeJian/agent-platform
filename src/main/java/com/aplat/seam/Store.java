@@ -36,6 +36,15 @@ public interface Store extends Seam {
 
     List<SessionEvent> events(String sessionId, long afterSeq);
 
+    /**
+     * 出现过事件的会话 id（排序）。
+     *
+     * <p>为什么这个方法必须存在：指标、追踪、运营台都要回答"现在有哪些会话"，
+     * 而在它之前只能靠 {@code /sessions/{id}/events} 一个个问——调用方得先知道 id，
+     * 于是"全量统计"这件事根本无从下手。**一个只能按已知键查询的存储，做不出运维面。**
+     */
+    List<String> sessionIds();
+
     void saveSnapshot(Snapshot snapshot);
 
     Optional<Snapshot> latestSnapshot(String sessionId);

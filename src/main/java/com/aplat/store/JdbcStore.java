@@ -410,6 +410,22 @@ public final class JdbcStore implements Store, AutoCloseable {
     // ------------------------------------------------------------------ 读
 
     @Override
+    public List<String> sessionIds() {
+        try (Connection c = connections.open();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT DISTINCT session_id FROM aplat_events ORDER BY session_id");
+             ResultSet rs = ps.executeQuery()) {
+            List<String> out = new ArrayList<>();
+            while (rs.next()) {
+                out.add(rs.getString(1));
+            }
+            return out;
+        } catch (SQLException e) {
+            throw new IllegalStateException("枚举会话失败：" + e.getMessage(), e);
+        }
+    }
+
+    @Override
     public List<SessionEvent> events(String sessionId, long afterSeq) {
         try (Connection c = connections.open();
              PreparedStatement ps = c.prepareStatement(
