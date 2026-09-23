@@ -1,6 +1,8 @@
 package com.aplat.web;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.aplat.llm.ScriptedLlmAdapter;
@@ -129,6 +131,27 @@ class EventStreamResumeTest {
 
         assertEquals(LongStream.rangeClosed(1, last).boxed().toList(), idsOf(a));
         assertEquals(idsOf(a), idsOf(b), "第二条流不受第一条流关闭的影响");
+    }
+
+    @Test
+    @DisplayName("raw=1：帧不带 event 字段，一律经 onmessage 抵达（时间线靠这条不漏事件）")
+    void rawModeMakesAllEventsReachableViaOnMessage() throws Exception {
+        start(500);
+        List<Long> all = seedSession("s-raw");
+
+        List<SseTestClient.Frame> frames = SseTestClient.collect(
+                transport.baseUrl() + "/agui/events/s-raw?raw=1&once=turn.closed", Duration.ofSeconds(15));
+
+        assertTrue(frames.size() >= all.size(), "应补齐全量事件: " + frames.size());
+        for (SseTestClient.Frame f : frames) {
+            assertNull(f.event(), "raw 模式下不该有具名事件，否则 onmessage 会漏掉它们");
+            assertNotNull(f.id(), "id 仍要在，续传游标不能丢");
+            assertTrue(f.data().contains("\"type\""), "事件名应留在 data 里: " + f.data());
+        }
+        // 默认（非 raw）模式仍应是具名事件——两种模式都要能用
+        List<SseTestClient.Frame> named = SseTestClient.collect(
+                transport.baseUrl() + "/agui/events/s-raw?once=turn.closed", Duration.ofSeconds(15));
+        assertNotNull(named.get(0).event());
     }
 
     @Test

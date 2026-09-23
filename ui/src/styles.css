@@ -5,6 +5,10 @@
   --ink: #1b1f24;
   --dim: #6b7280;
   --accent: #2f6fed;
+  --tool: #7c3aed;
+  --ok: #1a7f4b;
+  --warn: #b45309;
+  --err: #c0392b;
 }
 
 * {
@@ -28,16 +32,18 @@ body {
   display: flex;
   flex-direction: column;
   height: 100%;
-  max-width: 1000px;
+  max-width: 1500px;
   margin: 0 auto;
-  padding: 16px 18px 0;
+  padding: 14px 18px 0;
 }
+
+/* ---------------------------------------------------------------- 页头 */
 
 .page-head {
   display: flex;
   align-items: flex-start;
   gap: 16px;
-  padding-bottom: 12px;
+  padding-bottom: 10px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -58,12 +64,14 @@ body {
   padding: 1px 6px;
   border-radius: 5px;
   font-size: 12px;
+  font-family: ui-monospace, Menlo, monospace;
 }
 
 .links {
   margin-left: auto;
   display: flex;
-  gap: 14px;
+  gap: 12px;
+  align-items: center;
   font-size: 12.5px;
   padding-top: 2px;
 }
@@ -77,10 +85,35 @@ body {
   text-decoration: underline;
 }
 
+button.ghost {
+  font: inherit;
+  font-size: 12.5px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  border-radius: 7px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+button.ghost:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---------------------------------------------------------------- 主体布局 */
+
 .page-body {
   flex: 1;
   min-height: 0;
-  padding: 14px 0;
+  padding: 12px 0;
+  display: flex;
+  gap: 14px;
+}
+
+.chat-wrap {
+  flex: 1;
+  min-width: 0;
   display: flex;
 }
 
@@ -92,4 +125,239 @@ body {
 
 .chat > div {
   height: 100%;
+}
+
+.page-body.with-timeline .chat-wrap {
+  flex: 1 1 60%;
+}
+
+.page-foot {
+  padding: 6px 0 10px;
+  color: var(--dim);
+  font-size: 12px;
+  border-top: 1px solid var(--line);
+}
+
+/* ---------------------------------------------------------------- 工具卡片（U07b） */
+
+.tool-card {
+  border-left: 3px solid var(--tool);
+  background: #faf8ff;
+  border-radius: 0 8px 8px 0;
+  margin: 6px 0;
+  overflow: hidden;
+}
+
+.tool-card--failed {
+  border-left-color: var(--err);
+  background: #fff6f5;
+}
+
+.tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+  font-family: ui-monospace, Menlo, monospace;
+  text-align: left;
+  padding: 7px 10px;
+  cursor: pointer;
+  color: inherit;
+}
+
+.tool-head:hover {
+  background: rgba(124, 58, 237, 0.06);
+}
+
+.tool-caret {
+  color: var(--dim);
+}
+
+.tool-name {
+  color: var(--tool);
+  font-weight: 600;
+}
+
+.tool-card--failed .tool-name {
+  color: var(--err);
+}
+
+.tool-summary {
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46ch;
+}
+
+.tool-status {
+  margin-left: auto;
+  font-size: 11.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #eef1f5;
+  color: var(--dim);
+}
+
+.tool-status--running {
+  background: #fdf3e3;
+  color: var(--warn);
+}
+
+.tool-status--complete {
+  background: #e8f5ee;
+  color: var(--ok);
+}
+
+.tool-flag {
+  font-size: 11.5px;
+  color: var(--err);
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  padding: 0 6px;
+}
+
+.tool-body {
+  padding: 2px 10px 10px;
+}
+
+.tool-section + .tool-section {
+  margin-top: 6px;
+}
+
+.tool-label {
+  font-size: 11.5px;
+  color: var(--dim);
+  margin-bottom: 3px;
+}
+
+.tool-body pre {
+  margin: 0;
+  background: #0f1115;
+  color: #d7dae0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  overflow: auto;
+  max-height: 220px;
+}
+
+/* ---------------------------------------------------------------- 过程时间线（U07b） */
+
+.timeline {
+  flex: 0 0 38%;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.timeline-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.timeline-count {
+  color: var(--dim);
+  font-weight: 400;
+}
+
+.timeline-head button.ghost {
+  margin-left: auto;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #c3c8cf;
+}
+
+.dot.on {
+  background: var(--ok);
+}
+
+.dot.off {
+  background: var(--err);
+}
+
+.timeline-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 8px 10px;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.timeline-empty {
+  color: var(--dim);
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
+  font-size: 12.5px;
+  padding: 10px 6px;
+  margin: 0;
+}
+
+.tl-row {
+  display: grid;
+  grid-template-columns: 34px minmax(120px, max-content) 1fr;
+  gap: 8px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  align-items: baseline;
+}
+
+.tl-row:hover {
+  background: #f1f3f6;
+}
+
+.tl-seq {
+  color: #9aa1ac;
+  text-align: right;
+}
+
+.tl-type {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.tl-raw {
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tl-custom .tl-type {
+  color: #8a8f98;
+  font-weight: 400;
+}
+
+.tl-tool .tl-type {
+  color: var(--tool);
+}
+
+.tl-text .tl-type {
+  color: var(--accent);
+}
+
+.tl-done .tl-type {
+  color: var(--ok);
+}
+
+.tl-error .tl-type {
+  color: var(--err);
 }

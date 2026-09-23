@@ -357,4 +357,93 @@ AG-UI 事件里 `TOOL_CALL_*` 四件套**都发对了**（有测试钉住，上�
 
 这不是后端问题，也不是配置错了，而是 U07b（自研定制）本该做的事。
 
+---
+
+# U07b 工具卡片 + 过程时间线
+
+## 单元测试
+
+```
+Tests run: 131, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+## 真浏览器验收（CDP 驱动，页面证据）
+
+```
+发消息前已有工具卡片: 0
+工具卡片出现，用时约 0.5s，共 1 张
+```
+
+截图 `docs/screenshots/ui-03-toolcard-timeline.png` 里能同时看到两侧：
+
+**左侧 —— 工具卡片（已展开）**
+```
+shell  echo hello-from-http                       已完成
+参数
+{
+  "command": "echo hello-from-http"
+}
+结果
+hello-from-http
+ 
+已在沙箱中执行命令，输出为 hello-from-http。
+```
+页脚：`工具卡片 已注册 3 个（echo · add · shell）· 标注"会执行命令"的工具受策略拦截`
+
+**右侧 —— 过程时间线，11 条（逐条就是后端产生的原始会话事件）**
+```
+ 1  CUSTOM_INPUT_CLAIMED      {"text":"用 shell 打印当前目录","historyTurns":0}
+ 2  RUN_STARTED               {"input":"用 shell 打印当前目录"}
+ 3  CUSTOM_CONTEXT_PREPARED   {"step":1,"estimatedTokens":43,"compressed":false,...}
+ 4  STEP_STARTED              {"step":1}
+ 5  TOOL_CALL_START           {"args":"{\"command\":\"echo hello-from-http\"}",...}
+ 6  TOOL_CALL_END             {"step":1,"id":"call_fa0e6dc86","tool":"shell","ok":...}
+ 7  STATE_SNAPSHOT            {"messages":4,"state":"{\"step\":1}","step":1}
+ 8  CUSTOM_CONTEXT_PREPARED   {"step":2,"estimatedTokens":55,"compressed":false,...}
+ 9  STEP_STARTED              {"step":2}
+10  TEXT_MESSAGE_CONTENT      {"step":2,"text":"已在沙箱中执行命令，输出为 hello-f...}
+11  RUN_FINISHED              {"reason":"completed","text":"已在沙箱中执行命令，输出…}
+```
+
+注意第 1、3、8 条：`CUSTOM_*` 是**聊天面看不到的内部记账事件**（投影器有意过滤掉了）。
+时间线能看到它们，正是它存在的意义——排查"模型为什么忘了"的线索在
+`CUSTOM_CONTEXT_PREPARED` 的 `estimatedTokens/compressed` 里，不在聊天窗口里。
+
+## 这一段又踩了一个"静默失效"的坑
+
+时间线第一版显示 **0 条**，而服务端日志明明有 `events session=t-09vnq4ns lastEventId=0` —— 连接是通的。
+
+原因：**SSE 里帧一旦带 `event:` 字段，浏览器就按"具名事件"派发，`es.onmessage` 一条都收不到**，
+只能用 `addEventListener('那个名字')`。而我的时间线要"看全部事件"，就只能枚举事件名——
+后端一加新类型，界面就**静默少一条**。
+
+修法不是"枚举全部事件名"，而是让后端支持**无名帧**（`?raw=1`）：
+
+```
+id: 1
+data: {"type":"CUSTOM_INPUT_CLAIMED","sessionId":"s-rawcheck","seq":1,...}
+```
+
+没有 `event:` 行，全部走 `onmessage`；事件名没丢（`data` 里的 `type` 就是它）；
+`id:` 保留，续传游标照旧。加了 `SseWriterTest.unnamedFramesOmitEventField` 与
+`EventStreamResumeTest.rawModeMakesAllEventsReachableViaOnMessage` 两条用例钉住。
+
+> 顺带说明：自带的调试控制台（`/`）不受影响——它**故意**用 `addEventListener` 按类型接，
+> 因为那里就是"按事件类型做不同渲染"。两种模式各有各的用处。
+
+## TypeScript 教我的两件事
+
+工具卡片的 props 我没有手写形状，而是从装好的包里推：
+`React.ComponentProps<typeof CopilotKit>['renderToolCalls']` → 渲染器 →
+`React.ComponentProps<渲染器.render>`。过程中 `tsc` 否掉了我两版：
+
+1. `status` 是**枚举**（`ToolCallStatus`），不是字符串字面量 —— 手写的
+   `'InProgress' | 'Executing' | 'Complete'` 不兼容；
+2. 那个枚举**并没有从公开入口导出**（`@copilotkit/react-core` 没有它），所以别引用它的成员。
+
+最终改用联合类型自己的结构判别：`result !== undefined` ⇔ 这次调用已结束。
+比依赖枚举名更稳——枚举改了、或者它本来就不是字符串枚举，这里都不会坏。
+
+
 

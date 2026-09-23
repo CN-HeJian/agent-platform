@@ -6,6 +6,7 @@ import com.aplat.run.Platform;
 import com.aplat.seam.LlmAdapter;
 import com.aplat.seam.Sandbox;
 import com.aplat.seam.SessionEvent;
+import com.aplat.seam.Tool;
 import com.aplat.seam.SessionLog;
 import com.aplat.session.AgUiProjector;
 import com.aplat.tools.Json;
@@ -168,6 +169,8 @@ public final class HttpTransport implements AutoCloseable {
                 sendUiAsset(ex, path);
             } else if (path.equals("/kernel") && method.equals("GET")) {
                 sendJson(ex, 200, kernelReport());
+            } else if (path.equals("/tools") && method.equals("GET")) {
+                sendJson(ex, 200, toolsReport());
             } else if (path.equals("/run") && method.equals("POST")) {
                 handleRun(ex);
             } else if (path.equals("/agui/run") && method.equals("POST")) {
@@ -363,11 +366,13 @@ public final class HttpTransport implements AutoCloseable {
         long lastEventId = parseLong(q.getOrDefault("lastEventId",
                 ex.getRequestHeaders().getFirst("Last-Event-ID")), 0L);
         String once = q.get("once");
+        // raw=1：不写 event 字段，全部走 onmessage（给"要看全部事件"的时间线用）
+        boolean rawFrames = "1".equals(q.get("raw")) || "true".equals(q.get("raw"));
 
         SseWriter writer = null;
         Subscription subscription = null;
         try {
-            writer = startSse(ex);
+            writer = startSse(ex, !rawFrames);
             activeStreams.add(writer);
 
             EventPump pump = new EventPump(writer);
@@ -426,13 +431,23 @@ public final class HttpTransport implements AutoCloseable {
         return sub;
     }
 
-    private SseWriter startSse(HttpExchange ex) throws IOException {        Headers h = ex.getResponseHeaders();
+    private SseWriter startSse(HttpExchange ex) throws IOException {
+        return startSse(ex, true);
+    }
+
+    /**
+     * @param namedEvents false = 不写 {@code event:} 字段，让客户端一律走 {@code onmessage}。
+     *                    排查用的时间线要"看全部事件"，具名派发会逼它枚举事件名，
+     *                    后端一加新类型界面就静默少一条——所以那里走无名帧。
+     */
+    private SseWriter startSse(HttpExchange ex, boolean namedEvents) throws IOException {
+        Headers h = ex.getResponseHeaders();
         h.set("Content-Type", "text/event-stream; charset=utf-8");
         h.set("Cache-Control", "no-cache, no-transform");
         h.set("Connection", "keep-alive");
         h.set("X-Accel-Buffering", "no"); // 让 nginx 等反向代理不要缓冲，否则流式会变成整段返回
         ex.sendResponseHeaders(200, 0); // 0 = chunked，长度未知
-        return new SseWriter(ex.getResponseBody());
+        return new SseWriter(ex.getResponseBody(), namedEvents);
     }
 
     private void release(Subscription sub, SseWriter writer, HttpExchange ex, String reason) {
@@ -471,6 +486,29 @@ public final class HttpTransport implements AutoCloseable {
         out.put("activeStreams", activeStreams.size());
         out.put("auth", guard.enabled() ? "api-key" : "disabled(loopback only)");
         out.put("ui", uiAssets.available() ? "built" : "not built (run: cd ui && npm run build)");
+        return out;
+    }
+
+    /**
+     * 工具清单（管理面 / 前端用）。
+     *
+     * <p>前端靠它决定"有哪些工具、哪个需要人批准、哪个会执行命令"——
+     * 从而**不必把工具名硬编码在界面代码里**。加一个新工具，界面自动跟上。
+     */
+    private Map<String, Object> toolsReport() {
+        List<Map<String, Object>> tools = new ArrayList<>();
+        for (Tool tool : platform.kernel().ctx().get(com.aplat.seam.ToolRegistry.class).all()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("name", tool.name());
+            row.put("description", tool.spec().description());
+            row.put("approvalRequired", tool.approvalRequired());
+            row.put("executesCommands", tool.spec().executesCommands());
+            row.put("commandField", tool.spec().commandField());
+            tools.add(row);
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("tools", tools);
+        out.put("count", tools.size());
         return out;
     }
 

@@ -28,9 +28,10 @@
 | **API Key 守卫（U16 前置）** | `web/ApiKeyGuard` | ✅ 最小闸，完整鉴权仍属 U16 |
 | **工具策略（U15）** | `tools/ToolPolicy` + `ToolSpec.executing` | ✅ 工具级权限 + 危险命令，**不靠工具名** |
 | **前端聊天面（U07a）** | `ui/`（Vite + React + CopilotKit） | ✅ 直连 `/agui/run`，已用真浏览器验过 |
+| **工具卡片 + 过程时间线（U07b）** | `ui/src/ToolCard.tsx` · `ui/src/Timeline.tsx` | ✅ 工具参数/结果可视化；原始事件实时可见 |
 
 **尚未做**（按计划属后续需求单元）：MySQL Store（U18）、MCP 接入（U24）、耐久状态机（U19/U20）、
-RBAC（U25）、过程时间线与工具卡片渲染（U07b）、可观测台（U23）。
+RBAC（U25）、多模态与协作（U27+）、可观测台（U23）。
 
 ---
 
@@ -65,10 +66,16 @@ cd ui && npm install && npm run build && cd ..
 | `GET` | `/` | 内置调试控制台（**不是正式前端**，用肉眼确认 SSE 链路） |
 | `GET` | `/health` | 健康 + 装配自检（免鉴权，供探针） |
 | `GET` | `/kernel` | 装配清单与可替换能力缝（排查第一站） |
+| `GET` | `/tools` | 工具清单（名字/说明/是否需批准/是否执行命令）——**前端靠它渲染工具卡片，不硬编码工具名** |
 | `POST` | `/run` | `{"sessionId?","input"}` → 跑完一个 turn，返回 JSON |
 | `GET` | `/agui/stream?input=&sessionId=` | 简化流：跑一个 turn 并 SSE 吐**本平台信封**事件（自带控制台用） |
-| `GET` | `/agui/events/{sessionId}?lastEventId=` | 纯事件面：回填 + 实时，**断线续传** |
+| `GET` | `/agui/events/{sessionId}?lastEventId=` | 纯事件面：回填 + 实时，**断线续传**；加 `&raw=1` 则帧不带 `event:` 字段 |
 | `GET` | `/sessions/{sessionId}/events` | 回放为 JSON（离线排查） |
+
+> **`raw=1` 是给"要看全部事件"的客户端用的**（前端的过程时间线就走它）。
+> SSE 里帧一旦带 `event:`，浏览器就按**具名事件**派发，`es.onmessage` 收不到——
+> 于是只能枚举事件名，后端一加新类型界面就静默少一条。`raw=1` 让后端写无名帧，
+> 全部走 `onmessage`，新事件自动出现。事件名没丢，`data` 里的 `type` 就是它。
 
 **两种事件方言不要混**：`/agui/run` 吐的是 AG-UI **规范字段**（`threadId`/`messageId`/`delta`/
 `toolCallId`），给 CopilotKit、`@ag-ui/client` 这类客户端用；`/agui/stream` 吐的是本平台信封
@@ -123,6 +130,21 @@ const agents = { default: new HttpAgent({ url: `${location.origin}/agui/run` }) 
 > 另外如果你把 `APLAT_API_KEY` 打开了，前端**目前还不能自动带上**——
 > 静态资源免鉴权，但 `/agui/run` 会 401。要么先关掉 key，要么在 provider 里补 headers（属 U16 收尾）。
 
+#### 工具卡片与过程时间线（U07b）
+
+界面右侧是**过程时间线**：它订阅 `/agui/events/{threadId}?raw=1`，把后端产生的**原始会话事件**
+逐条摊开。它和聊天面看的东西刻意不同——聊天面只该看到"前端需要的规范事件"，
+而时间线要能看到被投影器有意过滤掉的内部记账事件（`CUSTOM_CONTEXT_PREPARED` 这类）。
+排查"模型为什么忘了"时，答案恰恰在那里，不在聊天窗口里。
+
+工具卡片则靠 `GET /tools` 动态生成渲染器（匹配规则是**精确工具名**，所以每个工具一条）。
+展开能看到参数与结果；被策略拒绝的工具会标红——因为后端把失败也原样回填成
+`ERROR[错误码]`，界面显示的与模型看到的完全一致。
+
+> 类型上的两个坑（都靠 `tsc` 才发现的）：`status` 是**枚举**不是字符串字面量；
+> 而那个枚举**没有从公开入口导出**。所以卡片改用联合类型自己的结构判别
+> （`result !== undefined` ⇔ 调用已结束），不引用任何枚举成员。
+
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -171,7 +193,10 @@ run/Demo            ← 离线段到端演示
   ├─ web/           HttpTransport / SseWriter / EventPump / ApiKeyGuard / ServerConfig
   │                 UiAssets（托管 ui/dist：路径穿越防护 + SPA 回退）
   └─ store/         InMemoryStore（Store 契约的参照实现）
-ui/                 ← 前端（U07a）：Vite + React + CopilotKit，产物由 /ui/ 托管
+ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产物由 /ui/ 托管
+  ├─ src/App.tsx        聊天面装配：直连 HttpAgent + 工具卡片渲染器 + 时间线
+  ├─ src/ToolCard.tsx   工具调用卡片（参数 / 结果 / 被拒标红）
+  └─ src/Timeline.tsx   过程时间线（订阅 /agui/events?raw=1）
 ```
 
 ### 三条贯穿全码的规则
@@ -197,11 +222,11 @@ ui/                 ← 前端（U07a）：Vite + React + CopilotKit，产物由
 | `BudgetContextProviderTest` | context：预算裁剪 / 分层压缩 / **双记录可归因** |
 | `AgentLoopTest` | **U04 验收**：3 步任务完成 · 编造工具名能自纠 · 预算终止 · 拒绝后改道 · 异常收口 |
 | `StoreContractTest` | store：seq 单调 / 增量 / 快照 / 幂等键 —— **日后 MySQL 实现继承这套断言** |
-| `SseWriterTest` | **U02**：帧格式 / data 单行 / 关闭后不写 / 写失败唤醒等待者 |
+| `SseWriterTest` | **U02**：帧格式 / data 单行 / **无名帧**（不写 `event:`，否则 `onmessage` 收不到）/ 写失败唤醒等待者 |
 | `ApiKeyGuardTest` | **U16 前置**：三种携带方式 / 错误 key 全拒 |
 | `EventPumpTest` | **U09**：回填与实时的重叠不重推、竞态窗口不漏事件 |
 | `HttpTransportTest` | **U02 验收**：一句话进去逐 token 出来 · 事件序列固定 · 参数校验 · 401 |
-| `EventStreamResumeTest` | **U09 验收**：任意游标续传 = 全量序列的后续段 · 断连后订阅被回收 |
+| `EventStreamResumeTest` | **U09 验收**：任意游标续传 = 全量序列的后续段 · `raw=1` 全量可达 · 断连后订阅被回收 |
 | `UiAssetsTest` | **U07a 前置**：路径穿越（含 `%2e%2e`）被挡 · SPA 回退 · MIME 正确 |
 | `ToolPolicyTest` | **U15 验收**：不靠名字拦截 · 声明哪个字段就查哪个 · 越权工具被拒 · 漏声明被 lint |
 | `AgUiProjectorTest` | **U08 验收**：AG-UI 规范字段 · step 生命周期配平 · 内部事件不外泄 |
@@ -234,9 +259,10 @@ ui/                 ← 前端（U07a）：Vite + React + CopilotKit，产物由
   `selfManagedAgents`（付费档）或架 runtime 代理。详见「前端（U07a）」一节的警告。
 - **前端还不能自动带 API Key**：开了 `APLAT_API_KEY` 后 `/ui/` 静态资源仍可访问，
   但 `/agui/run` 会 401。要么先关 key，要么给 provider 补 headers（U16 收尾）。
-- **工具调用在界面上还看不见**：AG-UI 事件里 `TOOL_CALL_*` 都发对了（有测试钉住），
-  但 CopilotKit 默认不知道该怎么画一个工具调用，需要注册 `renderToolCalls`——
-  属 U07b（自研定制）的范围。现在只能看到工具的**文字结果**。
+- **工具调用的可视化只覆盖"已知工具"**：`GET /tools` 是**启动时**拉一次的，运行中动态注册的
+  （未来的 MCP 工具）不会自动出现在界面上，需要刷新页面。属可接受的当前限制。
+- **过程时间线是"全量、无过滤"的**：它把内部事件也摊在界面上，所以**别对公网开放 `/ui/`** ——
+  里面有压缩决策、上下文规模这类内部信息。
 - **两种事件方言并存**（规范 AG-UI 与本平台信封）：这是刻意的，但有认知成本。
   `/agui/stream` + 内置控制台是 U02 时期的东西，等自研面（U07b）成熟后应当收掉一种。
 
@@ -244,13 +270,13 @@ ui/                 ← 前端（U07a）：Vite + React + CopilotKit，产物由
 
 ## 6. 下一步（按依赖顺序）
 
-1. **U07b 工具卡片 + 过程时间线**：前端的链已经通了，缺的是"工具调用怎么画"。
-   在 React 侧注册 `renderToolCalls`，把 `TOOL_CALL_START/ARGS/RESULT` 渲染成可展开的卡片。
-2. **U16 收尾**：让前端能带 API Key（provider headers），并把 `/agui/run` 的鉴权打通。
-   顺带补审计与限流（U17）。
-3. **U12/U13 HITL 四条路径**：`HitlDecision.Always` 目前按 `Once` 处理，需要会话级放行表；
-   传输层已能承载（HITL 会阻塞 handler 线程，正是长连接的用法）。
-4. **U18 MySQL Store**：实现 `Store`，继承 `StoreContractTest`。
-5. **U19/U20 耐久**：实现 `Durable`，`resume()` 用最近快照 + 其后事件重建。
+1. **U16 收尾**：让前端能带 API Key（provider headers），把 `/agui/run` 的鉴权打通；
+   顺带补审计与限流（U17）。现在 `/ui/` 的时间线会对任何能访问端口的人暴露内部信息，
+   所以这件事比"再多做点前端"更该先做。
+2. **U12/U13 HITL 四条路径**：`HitlDecision.Always` 目前按 `Once` 处理，需要会话级放行表；
+   传输层与前端都已能承载（确认交互落在 AG-UI 的审批事件上）。
+3. **U18 MySQL Store**：实现 `Store`，继承 `StoreContractTest`。
+4. **U19/U20 耐久**：实现 `Durable`，`resume()` 用最近快照 + 其后事件重建。
+5. **U24 MCP**：工具会在运行中动态出现，届时要让 `/tools` 的变更能推给前端（当前是启动时拉一次）。
 
 每一项都能独立开发、独立测试、独立交付——这正是需求单元化的目的。

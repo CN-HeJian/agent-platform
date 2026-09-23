@@ -130,6 +130,22 @@ class SseWriterTest {
     }
 
     @Test
+    @DisplayName("关闭具名事件后不写 event 字段——让客户端一律走 onmessage")
+    void unnamedFramesOmitEventField() {
+        SseWriter w = new SseWriter(sink, false);
+
+        w.event(event(7, "llm.chunk", Map.of("text", "hi")));
+
+        String frame = out();
+        assertFalse(frame.contains("event: "),
+                "带 event: 的帧会被浏览器当具名事件派发，onmessage 收不到——"
+                        + "排查用的时间线就会永远显示 0 条");
+        assertTrue(frame.startsWith("id: 7\n"), "id 仍要保留，续传游标不能丢");
+        assertTrue(frame.contains("\"type\":\"TEXT_MESSAGE_CONTENT\""),
+                "事件名没丢：data 里的 type 就是它");
+    }
+
+    @Test
     @DisplayName("重复 close 幂等；frameCount 如实反映写出量")
     void closeIsIdempotent() {
         SseWriter w = writer();

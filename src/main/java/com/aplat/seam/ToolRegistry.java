@@ -17,6 +17,15 @@ public interface ToolRegistry extends Seam {
 
     List<ToolSpec> specs();
 
+    /**
+     * 全部已注册工具（含"是否需批准"这类声明）。
+     *
+     * <p>与 {@link #specs()} 的区别：{@code specs()} 只给模型看（名字/说明/schema），
+     * 而这个给<b>管理面与前端</b>看——前端要靠它知道"有哪些工具、哪个危险"，
+     * 才不用把工具名硬编码在界面代码里。
+     */
+    List<Tool> all();
+
     default boolean contains(String name) {
         return find(name).isPresent();
     }

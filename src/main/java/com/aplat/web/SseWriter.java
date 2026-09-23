@@ -28,14 +28,31 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class SseWriter {
 
     private final OutputStream out;
+    private final boolean namedEvents;
     private final ReentrantLock lock = new ReentrantLock();
     private final CountDownLatch closedLatch = new CountDownLatch(1);
     private final AtomicLong frames = new AtomicLong();
     private volatile boolean closed;
     private volatile String closeReason;
 
+    /** 默认写 {@code event:} 字段（浏览器按具名事件派发，前端可以 {@code addEventListener} 挑着接）。 */
     public SseWriter(OutputStream out) {
+        this(out, true);
+    }
+
+    /**
+     * @param namedEvents false = **不写 {@code event:} 字段**。
+     *                    <p>这一条是 SSE 里很容易踩的坑：帧里一旦有 {@code event:}，
+     *                    浏览器就把它当**具名事件**派发，{@code es.onmessage} <b>收不到</b>——
+     *                    只能靠 {@code addEventListener('那个名字')}。
+     *                    对"要看全部事件"的场景（排查用的时间线）这就成了陷阱：
+     *                    得枚举所有事件名，一旦后端加了新类型，界面静默少一条。
+     *                    所以那种场景要显式要求"无名帧"，让一切都走 onmessage。
+     *                    （事件名并没丢——{@code data} 里本来就有 {@code type}。）
+     */
+    public SseWriter(OutputStream out, boolean namedEvents) {
         this.out = out;
+        this.namedEvents = namedEvents;
     }
 
     /** 写一条 AG-UI 事件。{@code id} 用会话内 seq，浏览器会自动带成 {@code Last-Event-ID} 回传。 */
@@ -88,7 +105,7 @@ public final class SseWriter {
         if (id != null) {
             sb.append("id: ").append(id).append('\n');
         }
-        if (event != null && !event.isBlank()) {
+        if (namedEvents && event != null && !event.isBlank()) {
             sb.append("event: ").append(event).append('\n');
         }
         // data 必须是单行：Jackson 输出的 JSON 不含裸换行，这里再兜一层

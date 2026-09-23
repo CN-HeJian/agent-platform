@@ -46,6 +46,11 @@ public final class DefaultToolRegistry implements ToolRegistry {
         return out;
     }
 
+    @Override
+    public synchronized List<Tool> all() {
+        return List.copyOf(tools.values());
+    }
+
     public synchronized int size() {
         return tools.size();
     }
