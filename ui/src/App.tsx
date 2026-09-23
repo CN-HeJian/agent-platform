@@ -3,6 +3,7 @@ import { CopilotKit } from '@copilotkit/react-core'
 import { CopilotChat } from '@copilotkit/react-ui'
 import { HttpAgent } from '@ag-ui/client'
 
+import { ApprovalPanel } from './ApprovalPanel'
 import { ToolCard, type ToolInfo } from './ToolCard'
 import { Timeline } from './Timeline'
 import { loadApiKey, saveApiKey } from './apiKey'
@@ -41,6 +42,7 @@ export function App() {
   const [threadId, setThreadId] = useState(newThreadId)
   const [tools, setTools] = useState<ToolInfo[]>([])
   const [showTimeline, setShowTimeline] = useState(true)
+  const [showApprovals, setShowApprovals] = useState(true)
   const [apiKey, setApiKey] = useState(loadApiKey)
   const [toolsError, setToolsError] = useState<string | null>(null)
 
@@ -90,6 +92,9 @@ export function App() {
     [url, apiKey],
   )
 
+  // 页脚要能提前告诉人"哪些工具会拦你"——不然第一次被拦会以为是卡住了
+  const requireApproval = useMemo(() => tools.filter((t) => t.approvalRequired), [tools])
+
   const resetThread = useCallback(() => setThreadId(newThreadId()), [])
 
   const onKeyChange = useCallback((value: string) => {
@@ -123,6 +128,9 @@ export function App() {
             <button type="button" className="ghost" onClick={resetThread}>
               新会话
             </button>
+            <button type="button" className="ghost" onClick={() => setShowApprovals((v) => !v)}>
+              {showApprovals ? '隐藏确认栏' : '显示确认栏'}
+            </button>
             <button type="button" className="ghost" onClick={() => setShowTimeline((v) => !v)}>
               {showTimeline ? '隐藏时间线' : '显示时间线'}
             </button>
@@ -145,6 +153,7 @@ export function App() {
               }}
             />
           </section>
+          {showApprovals && <ApprovalPanel threadId={threadId} apiKey={apiKey || undefined} />}
           {showTimeline && <Timeline threadId={threadId} apiKey={apiKey || undefined} />}
         </main>
 
@@ -154,7 +163,8 @@ export function App() {
             : tools.length
               ? `工具卡片已注册 ${tools.length} 个（${tools.map((t) => t.name).join(' · ')}）`
               : '工具清单加载中…'}
-          {tools.some((t) => t.executesCommands) && ' · 标注"会执行命令"的工具受策略拦截'}
+          {requireApproval.length > 0 &&
+            ` · ${requireApproval.map((t) => t.name).join(' / ')} 执行前需人工确认`}
           {!apiKey && ' · 未填 API Key（后端未开鉴权时可忽略）'}
         </footer>
       </div>

@@ -22,6 +22,21 @@ class ToolPipelineTest {
         return r;
     }
 
+    /** 一个"每次都给同一个答案"的 HITL 桩：四条路径的用例靠它，不必重复写匿名类。 */
+    private static Hitl fixed(HitlDecision decision) {
+        return new Hitl() {
+            @Override
+            public String id() {
+                return "hitl.test-fixed";
+            }
+
+            @Override
+            public HitlDecision request(com.aplat.seam.HitlRequest request) {
+                return decision;
+            }
+        };
+    }
+
     @Test
     @DisplayName("1) 幻觉防护：不存在的工具返回 UNKNOWN_TOOL，并告诉模型有哪些可用工具")
     void unknownToolReturnsStructuredError() {
@@ -122,6 +137,36 @@ class ToolPipelineTest {
                 .execute("s1", ToolCall.of("shell", "{\"command\":\"ls\"}"));
 
         assertEquals(ToolResult.ERR_TIMEOUT, result.errorCode());
+    }
+
+    @Test
+    @DisplayName("4d) 改参不能绕过策略：把命令改成危险的那条，照样被拦")
+    void modifiedArgsAreReCheckedAgainstPolicy() {
+        DefaultToolRegistry r = registryWithEcho();
+        r.register(Tool.requiringApproval(ToolSpec.executing("shell", "shell", "{}", "command"),
+                call -> ToolResult.ok("executed: " + call.argumentsJson())));
+        ToolPipeline pipeline = new ToolPipeline(r, fixed(new HitlDecision.Modified(
+                "{\"command\":\"rm -rf /\"}")));
+
+        ToolResult result = pipeline.execute("s1",
+                ToolCall.of("shell", "{\"command\":\"echo harmless\"}"));
+
+        assertEquals(ToolResult.ERR_BLOCKED, result.errorCode(),
+                "批的是 echo、执行的是 rm —— 改参如果不重过策略，这就是个后门");
+        assertTrue(result.content().contains("modified arguments"), result.content());
+    }
+
+    @Test
+    @DisplayName("4e) 改参必须是合法 JSON 对象，否则 INVALID_ARGS（不猜、不兜）")
+    void modifiedArgsMustBeJsonObject() {
+        DefaultToolRegistry r = registryWithEcho();
+        r.register(Tool.requiringApproval(ToolSpec.executing("shell", "shell", "{}", "command"),
+                call -> ToolResult.ok("executed")));
+
+        ToolResult result = new ToolPipeline(r, fixed(new HitlDecision.Modified("[1,2,3]")))
+                .execute("s1", ToolCall.of("shell", "{\"command\":\"ls\"}"));
+
+        assertEquals(ToolResult.ERR_INVALID_ARGS, result.errorCode());
     }
 
     @Test

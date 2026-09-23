@@ -58,6 +58,18 @@ public final class Kernel {
             return this;
         }
 
+        /**
+         * 已绑定的会话日志（{@code withDefaults()} 之后可用）。
+         *
+         * <p>给装配根解决一个先后问题：有些实现（如 {@link com.aplat.hitl.InteractiveHitl}）
+         * 需要往会话日志里写事件，而日志是内核建的——它没法先于内核被 new 出来。
+         * 在这里把日志取出来交给工厂方法，比在别处搞"延迟注入"要老实。
+         */
+        public SessionLog sessionLog() {
+            return kernel.registry.optional(SessionLog.class)
+                    .orElseThrow(() -> new MissingSeamException(SessionLog.class));
+        }
+
         public Kernel build() {
             // 会话日志是排查之根，装配期就必须在
             if (!kernel.registry.isBound(SessionLog.class)) {

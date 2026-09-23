@@ -30,6 +30,7 @@
 | **工具策略（U15）** | `tools/ToolPolicy` + `ToolSpec.executing` | ✅ 工具级权限 + 危险命令，**不靠工具名** |
 | **前端聊天面（U07a）** | `ui/`（Vite + React + CopilotKit） | ✅ 直连 `/agui/run`，已用真浏览器验过 |
 | **工具卡片 + 过程时间线（U07b）** | `ui/src/ToolCard.tsx` · `ui/src/Timeline.tsx` | ✅ 工具参数/结果可视化；原始事件实时可见 |
+| **人工确认 HITL（U12/U13）** | `hitl/InteractiveHitl` + `ui/src/ApprovalPanel.tsx` | ✅ once / always / deny / modify / timeout 五条路径，全程留痕 |
 
 **尚未做**（按计划属后续需求单元）：MySQL Store（U18）、MCP 接入（U24）、耐久状态机（U19/U20）、
 RBAC（U25）、多模态与协作（U27+）、可观测台（U23）。
@@ -69,6 +70,8 @@ cd ui && npm install && npm run build && cd ..
 | `GET` | `/kernel` | 装配清单与可替换能力缝（排查第一站） |
 | `GET` | `/tools` | 工具清单（名字/说明/是否需批准/是否执行命令）——**前端靠它渲染工具卡片，不硬编码工具名** |
 | `GET` | `/audit?limit=N` | 审计：谁 / 何时 / 调了什么 / 结果（受鉴权保护——审计记录本身也是敏感信息） |
+| `GET` | `/hitl/pending?sessionId=` | 谁在等人批准：工具 / 参数 / 理由 / 剩余时间 |
+| `POST` | `/hitl/{requestId}` | 提交决定：`{"decision":"once\|always\|deny\|modify","arguments?"}` |
 | `POST` | `/run` | `{"sessionId?","input"}` → 跑完一个 turn，返回 JSON |
 | `GET` | `/agui/stream?input=&sessionId=` | 简化流：跑一个 turn 并 SSE 吐**本平台信封**事件（自带控制台用） |
 | `GET` | `/agui/events/{sessionId}?lastEventId=` | 纯事件面：回填 + 实时，**断线续传**；加 `&raw=1` 则帧不带 `event:` 字段 |
@@ -183,6 +186,40 @@ const agents = { default: new HttpAgent({ url: `${location.origin}/agui/run` }) 
 > 而那个枚举**没有从公开入口导出**。所以卡片改用联合类型自己的结构判别
 > （`result !== undefined` ⇔ 调用已结束），不引用任何枚举成员。
 
+### 人工确认（U12 + U13）
+
+**默认就是 `ask`。** 一个能执行 shell 的服务，"先问"才是诚实的默认值——
+之前 `HitlDecision.Always` 被当 `Once` 处理、也没有任何交互通道，
+等于"工具需批准"**实际总是批准**，安全语义是空的。现在四条路径各自落地：
+
+```bash
+# 起服务时不设就是 ask（默认）；本地想跳过就 APLAT_HITL=allow
+export APLAT_HITL_TIMEOUT_SEC=120
+./mvnw -q compile exec:java@serve
+
+# 另一个终端里看谁在等你
+curl -s -H 'X-API-Key: dev-secret' 'http://127.0.0.1:8787/hitl/pending?sessionId=s1'
+curl -s -X POST -H 'X-API-Key: dev-secret' -H 'Content-Type: application/json' \
+     -d '{"decision":"once"}' http://127.0.0.1:8787/hitl/h1
+```
+
+| 决策 | 后果 | 注意 |
+|---|---|---|
+| `once` | 只放行这次 | 下一个命令还会再问 |
+| `always` | **本会话 × 本工具 × 任意参数** 不再问 | 对 `shell` 而言等于"这个会话里随便跑命令"；不跨会话 |
+| `deny` | 不执行，理由回填给模型让它**改道** | 不是"重试"——错误码是 `DENIED` |
+| `modify` | 改完再执行 | **后端会把改后的参数重新过一遍策略** |
+| （超时） | 按不执行处理，错误码 `TIMEOUT` | 与 `denied` 分开：一个说"人不在"，一个说"人反对" |
+
+**改参必须重过策略**，这条不是形式主义：审批时看到的是 `echo hi`，
+如果改参后直接执行，用户（或一个被栽了的前端）就能把命令换成 `rm -rf /`。
+真机验过：把命令改成 `rm -rf /` 会拿到 `BLOCKED_BY_POLICY / DESTRUCTIVE_RM`。
+
+**前端面板在中间那栏**（`ui/src/ApprovalPanel.tsx`）：四个按钮 + 一个改参编辑器。
+需要批准的工具在执行前会让卡片出现，卡片上有参数、理由和剩余秒数。
+状态真相取自 `GET /hitl/pending` 而不是从事件流推导——**超时不产生任何事件**，
+只靠事件流那些"等人点"的卡片会永远挂在界面上；顺带还解决了多端同时打开的问题。
+
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -195,6 +232,8 @@ const agents = { default: new HttpAgent({ url: `${location.origin}/agui/run` }) 
 | `APLAT_CORS_ANY_ORIGIN` | `true` | 开发态方便前端；生产应收紧 |
 | `APLAT_RATE_LIMIT_PER_MIN` | `120` | 按调用方隔离的每分钟请求上限；`0` = 不限 |
 | `APLAT_AUDIT_FILE` | 空 | 设了就落盘为 JSON Lines；不设只留内存（重启即丢） |
+| `APLAT_HITL` | `ask` | `ask` = 停等人批准；`allow` = 不问人直接放行；`deny` = 直接拒绝 |
+| `APLAT_HITL_TIMEOUT_SEC` | `120` | 无人应答的等待上限；到点按超时处理（与「拒绝」区分） |
 
 ### 在 IntelliJ IDEA 里
 
@@ -225,6 +264,7 @@ run/Demo            ← 离线段到端演示
   ├─ kernel/        Ctx / SeamRegistry / EventBus / Kernel
   ├─ seam/          9 条能力缝接口 + DTO（无实现）
   ├─ loop/          AgentLoop（构造注入，无插件壳）
+  ├─ hitl/          InteractiveHitl（U12/U13）：真的停下来等人 + 会话级放行表
   ├─ tools/         ToolPipeline（五道判断）+ ToolPolicy（U15）+ 内置工具 + shell 工具
   ├─ sandbox/       CommandPolicy / ProcessSandbox / DockerSandbox
   ├─ context/       BudgetContextProvider（三层压缩 + 双记录）
@@ -274,6 +314,9 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
 | `RateLimiterTest` | **U17**：额度用满即拒 · 按时间连续补充 · 不超补 · `Retry-After` 向上取整 · 按调用方隔离 |
 | `AuditLogTest` | **U17**：可追溯 · 内存有界 · 落盘 JSONL · **close 不丢记录** · **绝不记密钥原文** |
 | `AuthAuditRateLimitTest` | **U16/U17 验收**：401 / 免鉴权白名单 / 429+Retry-After / 审计指纹 / 流式请求记成 200 |
+| `InteractiveHitlTest` | **U12 验收**：五条路径 · always 只在本会话生效 · 超时与回答撞车只有一个赢家 · 不接受伪造的 timeout |
+| `HitlEndpointTest` | **U12/U13 验收**：run 挂住等人 → 队列可见 → 回答后继续跑并**真的执行了** · 409 / 400 / 501 / 401 |
+| （`ToolPipelineTest` 4d/4e） | **U13 加固**：改参后**重新过策略**（否则"人改参"就是个后门）· 改参必须是合法 JSON 对象 |
 
 `StoreContractTest` 的用法是有意的：写 MySQL 实现时不要另写一套测试，让它跟内存实现
 跑同一组断言。这才是"可替换"的证明方式。
@@ -307,12 +350,20 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
   而那需要先确定信任边界——现在刻意没做，免得给出一个看着对其实可伪造的值。
 - **前端直连只适合本地**：`agents__unsafe_dev_only` 是官方给开发用的口子，生产要走
   `selfManagedAgents`（付费档）或架 runtime 代理。详见「前端（U07a）」一节的警告。
-- **前端还不能自动带 API Key**：开了 `APLAT_API_KEY` 后 `/ui/` 静态资源仍可访问，
-  但 `/agui/run` 会 401。要么先关 key，要么给 provider 补 headers（U16 收尾）。
 - **工具调用的可视化只覆盖"已知工具"**：`GET /tools` 是**启动时**拉一次的，运行中动态注册的
   （未来的 MCP 工具）不会自动出现在界面上，需要刷新页面。属可接受的当前限制。
 - **过程时间线是"全量、无过滤"的**：它把内部事件也摊在界面上，所以**别对公网开放 `/ui/`** ——
   里面有压缩决策、上下文规模这类内部信息。
+- **`always` 的粒度是「会话 × 工具 × 任意参数」**：点一次「本会话总是允许」，对 `shell` 而言就是
+  该会话内不再拦截任何命令。这是它好用的原因也是它的风险，所以粒度写在了按钮的 title 里。
+  更细的粒度（按命令模式放行）得等权限体系（U25）。
+- **等待确认期间断连不会中止 turn**：SSE 客户端断开后循环仍在跑，那次确认会一路等到超时。
+  这是刻意的——断线多半是网络抖动，直接取消一个正在进行的任务更糟；
+  但也意味着「关掉浏览器」不等于「取消这次待批操作」（要取消就去提交一个 `deny`）。
+- **放行表与待确认队列都只在内存里**：重启即清空，多实例之间也不共享
+  （在 A 实例点了「总是允许」，B 实例还会问）。与限流同一个问题，等共享状态（U18/U26）。
+- **前端面板按会话过滤**：只显示当前 thread 的待确认。想看全部会话的待办，
+  用 `GET /hitl/pending`（不带 `sessionId`）。
 - **两种事件方言并存**（规范 AG-UI 与本平台信封）：这是刻意的，但有认知成本。
   `/agui/stream` + 内置控制台是 U02 时期的东西，等自研面（U07b）成熟后应当收掉一种。
 
@@ -320,13 +371,16 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
 
 ## 6. 下一步（按依赖顺序）
 
-1. **U12/U13 HITL 四条路径**：`HitlDecision.Always` 目前按 `Once` 处理，需要会话级放行表；
-   这是**功能上的最大缺口**（现在"工具需批准"实际等于"总是批准"）。
-   传输层、AG-UI 契约、前端卡片都已能承载。
-2. **U18 MySQL Store**：实现 `Store`，继承 `StoreContractTest`；顺带把审计也接进去，
-   这样审计才真正重启不丢。
-3. **U19/U20 耐久**：实现 `Durable`，`resume()` 用最近快照 + 其后事件重建。
-4. **U24 MCP**：工具会在运行中动态出现，届时要让 `/tools` 的变更能推给前端（当前是启动时拉一次）。
-5. **U25 RBAC + 密钥管理**：把"一个共享 key"升级成按用户/角色的授权与轮转。
+1. **U18 MySQL Store**：实现 `Store`，继承 `StoreContractTest`。它一次解决三件事——
+   重启不丢（含审计）、恢复有了地基（U19/U20）、限流与 HITL 放行表有了跨实例共享的落点。
+2. **U19/U20 耐久**：实现 `Durable`，`resume()` 用最近快照 + 其后事件重建。
+   现在 `AgentLoop` 只写 `state.snapshot` 事件、并不消费 `Store` 的快照接口，
+   所以崩溃后**不会真的续跑**——这是入口，不是 bug。
+3. **U24 MCP**：工具会在运行中动态出现，届时要让 `/tools` 的变更能推给前端（当前是启动时拉一次），
+   并让 MCP 工具也能声明 `commandField`，从而自动落进策略与确认门控。
+4. **U25 RBAC + 密钥管理**：把「一个共享 key」升级成按用户/角色的授权与轮转；
+   HITL 的放行表也该跟着变成「按角色可放行哪些工具」。
+5. **U22 调度**：定时任务若碰到需要批准的工具，要决定是「提前批准」还是「到点没人就跳过」——
+   这是 HITL 与调度交叉处唯一需要新设计的地方。
 
 每一项都能独立开发、独立测试、独立交付——这正是需求单元化的目的。

@@ -43,6 +43,8 @@ public interface SessionLog extends Seam {
     String EV_TOOL_RESULT = "tool.result";
     String EV_HITL_REQUEST = "hitl.requested";
     String EV_HITL_RESOLVED = "hitl.resolved";
+    /** 没问人就放行了（配置允许、或本会话已 "always"）。留痕是为了让回放不出现"莫名执行"的空白。 */
+    String EV_HITL_AUTO = "hitl.auto_approved";
     String EV_CONTEXT_PREPARED = "context.prepared";
     String EV_STATE_SNAPSHOT = "state.snapshot";
     String EV_ERROR = "error";

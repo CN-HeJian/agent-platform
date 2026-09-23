@@ -267,4 +267,60 @@ class AgUiProjectorTest {
         weird.put("nested", Map.of("a", 1));
         assertTrue(projector().project(ev(2, "context.prepared", weird)).isEmpty());
     }
+
+    @Test
+    @DisplayName("人工确认走 CUSTOM：协议没有审批事件，硬造顶层类型会让客户端拒掉整条流")
+    void hitlEventsAreProjectedAsCustom() {
+        AgUiProjector p = projector();
+        p.project(ev(1, "turn.started", Map.of()));
+
+        List<Map<String, Object>> out = p.project(ev(2, "hitl.requested", Map.of(
+                "requestId", "h1", "tool", "shell",
+                "args", "{\"command\":\"echo hi\"}", "reason", "会执行命令", "timeoutSec", 120)));
+
+        assertEquals(List.of("CUSTOM"), types(out));
+        assertEquals("HITL_REQUESTED", out.get(0).get("name"));
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> value = (Map<String, Object>) out.get(0).get("value");
+        assertEquals("h1", value.get("requestId"));
+        assertEquals("shell", value.get("tool"));
+        assertEquals("{\"command\":\"echo hi\"}", value.get("args"),
+                "参数要原样传到界面——审批人看的就是它");
+
+        List<Map<String, Object>> resolved = p.project(ev(3, "hitl.resolved", Map.of(
+                "requestId", "h1", "tool", "shell", "decision", "deny", "detail", "太危险")));
+        assertEquals("HITL_RESOLVED", resolved.get(0).get("name"));
+
+        // 配置放行那条也要外泄：否则界面显示"没人问就执行了"，分不清是配置还是漏了
+        List<Map<String, Object>> auto = p.project(ev(4, "hitl.auto_approved",
+                Map.of("tool", "shell", "reason", "session-allowlist")));
+        assertEquals("HITL_AUTO_APPROVED", auto.get(0).get("name"));
+    }
+
+    @Test
+    @DisplayName("确认事件夹在工具调用中间，但不能把 step 拆散（AG-UI 会拒绝不平配的流）")
+    void hitlDoesNotDisturbStepLifecycle() {
+        AgUiProjector p = projector();
+        List<Map<String, Object>> all = new ArrayList<>();
+        all.addAll(p.project(ev(1, "turn.started", Map.of())));
+        all.addAll(p.project(ev(2, "step.started", Map.of("step", 1))));
+        all.addAll(p.project(ev(3, "tool.call", Map.of("step", 1, "id", "c1", "tool", "shell", "args", "{}"))));
+        all.addAll(p.project(ev(4, "hitl.requested", Map.of("requestId", "h1", "tool", "shell",
+                "args", "{}", "reason", "", "timeoutSec", 120))));
+        all.addAll(p.project(ev(5, "hitl.resolved", Map.of("requestId", "h1", "tool", "shell",
+                "decision", "once", "detail", ""))));
+        all.addAll(p.project(ev(6, "tool.result", Map.of("step", 1, "id", "c1", "tool", "shell",
+                "ok", true, "content", "hi"))));
+        all.addAll(p.project(ev(7, "turn.closed", Map.of("reason", "completed"))));
+
+        assertEquals(List.of(
+                "RUN_STARTED",
+                "STEP_STARTED",
+                "TOOL_CALL_START", "TOOL_CALL_ARGS",
+                "CUSTOM",
+                "CUSTOM",
+                "TOOL_CALL_END", "TOOL_CALL_RESULT",
+                "STEP_FINISHED", "RUN_FINISHED"), types(all));
+    }
 }

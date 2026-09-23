@@ -100,6 +100,34 @@ class AgentLoopTest {
     }
 
     @Test
+    @DisplayName("U13 验收：拒绝回填后模型真的改道——换成另一个工具把任务做完")
+    void denialMakesModelRerouteToAnotherTool() {
+        ScriptedLlmAdapter llm = new ScriptedLlmAdapter()
+                .thenToolCall("shell", "{\"command\":\"ls /tmp\"}")
+                .thenToolCall("add", "{\"a\":20,\"b\":22}")
+                .thenText("不让执行命令，那我直接算：结果是 42。");
+
+        Platform p = platform(llm, Hitl.autoDeny("用户不批准执行命令"), LoopBudget.defaults());
+        TurnResult r = p.loop().run("s1", "看看 /tmp，再帮我算 20+22");
+
+        assertTrue(r.ok(), r.finalText());
+        assertEquals(3, r.steps(), "一步被拒 → 一步改道 → 一步收口");
+
+        var log = (EventSourcedSessionLog) p.sessionLog();
+        assertEquals(ToolResult.ERR_DENIED, log.ofType("s1", SessionLog.EV_TOOL_RESULT).get(0).str("errorCode"));
+        assertEquals(Boolean.TRUE, log.ofType("s1", SessionLog.EV_TOOL_RESULT).get(1).payload().get("ok"));
+
+        // 验收的关键：模型在第三步必须**看得见**被拒这件事与理由，
+        // 否则"改道"只是碰巧——下次它还会再撞一次同一道门。
+        String seen = llm.requests().get(2).messages().stream()
+                .filter(m -> "tool".equals(m.role()))
+                .map(m -> m.content())
+                .reduce("", (a, b) -> a + b);
+        assertTrue(seen.contains(ToolResult.ERR_DENIED), "拒绝要以观察形式回填: " + seen);
+        assertTrue(seen.contains("用户不批准执行命令"), "理由也要带上，模型才知道边界在哪");
+    }
+
+    @Test
     @DisplayName("模型异常被记为 error 事件，turn 以 ERROR 收口而不是抛给调用方")
     void llmFailureIsContained() {
         var brokenLlm = new com.aplat.seam.LlmAdapter() {

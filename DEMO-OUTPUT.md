@@ -556,3 +556,175 @@ POST /agui/run   0   id=298754db   note=-
 
 
 
+
+---
+
+# U12 + U13 人工确认：真实运行记录
+
+服务以 `APLAT_HITL=ask`（默认）+ `APLAT_HITL_TIMEOUT_SEC=60` + 开启鉴权启动。
+
+## 单元测试
+
+```
+[INFO] Tests run: 14, Failures: 0, Errors: 0 -- in com.aplat.hitl.InteractiveHitlTest
+[INFO] Tests run:  9, Failures: 0, Errors: 0 -- in com.aplat.web.HitlEndpointTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0 -- in com.aplat.tools.ToolPipelineTest
+[INFO] Tests run:  7, Failures: 0, Errors: 0 -- in com.aplat.loop.AgentLoopTest
+[INFO] Tests run: 17, Failures: 0, Errors: 0 -- in com.aplat.session.AgUiProjectorTest
+[INFO] Tests run: 186, Failures: 0, Errors: 0
+[INFO] BUILD SUCCESS
+```
+
+## 启动横幅
+
+```
+[kernel] seams:
+  - Hitl -> InteractiveHitl
+HITL    : hitl.interactive(ask, timeout=60s)
+
+=== 已启动 http://127.0.0.1:8787 ===
+鉴权    : X-API-Key 已启用（/health 与 /ui/ 静态资源豁免）
+人工确认: 已开启 —— shell 这类工具执行前会停下来等人
+          网页上点批准，或者命令行：
+            curl -s -H 'X-API-Key: <你的key>' http://127.0.0.1:8787/hitl/pending
+            curl -s -X POST -H 'X-API-Key: <你的key>' http://127.0.0.1:8787/hitl/<requestId> \
+                 -H 'Content-Type: application/json' -d '{"decision":"once"}'
+          60s 内没人应答按超时处理（与「拒绝」不同：模型会被告知「人不在」）
+          本地想跳过这道门：APLAT_HITL=allow
+```
+
+## 路径一：批准（once）
+
+`POST /run` 挂在那儿等人，另一个连接去回答——这就是真实的人机往返。
+
+```
+$ curl -s "$BASE/hitl/pending?sessionId=s-live" -H "X-API-Key: $K"
+{
+    "interactive": true,
+    "mode": "ask",
+    "timeoutSec": 60,
+    "count": 1,
+    "pending": [
+        {
+            "requestId": "h1",
+            "sessionId": "s-live",
+            "tool": "shell",
+            "args": "{\"command\":\"echo hello-from-http\"}",
+            "reason": "工具 shell 会执行命令（参数 command）",
+            "requestedAt": "2026-09-23T07:05:56.877968Z",
+            "expiresAt": "2026-09-23T07:06:56.877968Z",
+            "remainingMs": 57002
+        }
+    ]
+}
+
+$ curl -s -X POST "$BASE/hitl/h1" -d '{"decision":"once"}'
+{"requestId":"h1","decision":"once","accepted":true}
+
+$ curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE/hitl/h1" -d '{"decision":"once"}'
+409
+{"error":"NOT_PENDING","message":"no pending approval 'h1' (already answered, expired, or unknown)"}
+
+# 那个挂着的 /run 现在返回了：
+{"sessionId":"s-live","status":"COMPLETED","steps":2,"finalText":"已在沙箱中执行命令，输出为 hello-from-http。","events":13}
+```
+
+会话回放里，HITL 与工具执行的关系一目了然（注意：这个端点的 `type` 已经是 **AG-UI 名**）：
+
+```
+{"seq":5,"type":"TOOL_CALL_START","payload":{"tool":"shell","args":"{\"command\":\"echo hello-from-http\"}",...}}
+{"seq":6,"type":"CUSTOM_HITL_REQUESTED","payload":{"requestId":"h1","tool":"shell","reason":"工具 shell 会执行命令（参数 command）","timeoutSec":60}}
+{"seq":7,"type":"CUSTOM_HITL_RESOLVED","payload":{"requestId":"h1","tool":"shell","decision":"once","detail":""}}
+{"seq":8,"type":"TOOL_CALL_END","payload":{"tool":"shell","ok":true,"errorCode":null,"content":"hello-from-http\n"}}
+```
+
+**第 8 条的 `ok:true` 才是这件事的重点**：不是"看起来批准了"，是命令真的跑了。
+
+## 路径二：改参（modify）
+
+```
+$ curl -s -X POST "$BASE/hitl/h3" -d '{"decision":"modify","arguments":"{\"command\":\"echo changed-by-human\"}"}'
+
+{"seq":7,"type":"CUSTOM_HITL_RESOLVED","payload":{"requestId":"h3","tool":"shell","decision":"modified","detail":"args → {\"command\":\"echo changed-by-human\"}"}}
+{"seq":8,"type":"TOOL_CALL_END","payload":{"tool":"shell","ok":true,"content":"changed-by-human\n"}}
+```
+
+改动本身也被记进 `hitl.resolved` —— 否则事后根本解释不了"为什么执行的是这条命令"。
+
+## 路径三：改参成危险命令 → 策略拦下
+
+这是本轮最重要的一条安全断言。审批时看到的是 `echo hi`；如果改参后直接执行，
+那么"改参"就成了绕过策略的后门。
+
+```
+$ curl -s -X POST "$BASE/hitl/h4" -d '{"decision":"modify","arguments":"{\"command\":\"rm -rf /\"}"}'
+
+TOOL_CALL_END:
+  ok=False errorCode=BLOCKED_BY_POLICY
+  内容: modified arguments rejected by policy: DESTRUCTIVE_RM:
+        command matches blocked pattern DESTRUCTIVE_RM; run it manually outside the agent if it is real
+```
+
+## 路径四：拒绝（deny）与超时（timeout）
+
+两者**错误码不同**，因为模型该做的事不同：
+
+```
+deny    → ERROR[DENIED]  user denied execution: ... try another approach.
+          模型应当换个做法（U13 验收：AgentLoopTest.denialMakesModelRerouteToAnotherTool
+          断言了第三步的请求里确实能看到 DENIED 与理由）
+
+timeout → ERROR[TIMEOUT] no human response in time. abort this action and continue without it.
+```
+
+## 前端面板（CDP 驱动无头 Chrome，真点击）
+
+发送一句话之后：
+
+```
+页面面板： {"chat":true,"approvals":true,"timeline":true,"key":10}
+审批卡片： shell | 剩余 60s | 工具 shell 会执行命令（参数 command）
+           | {"command":"echo hello-from-http"} | 允许一次 | 本会话总是允许 | 拒绝 | 改参数…
+待确认计数： 1                                    → docs/screenshots/ui-05-hitl-pending.png
+
+已点「允许一次」
+审批卡片已消失
+批准后： {"toolCard":"shell | echo hello-from-http | 已完成",
+         "pendingCount":"0","toast":"已提交：once",
+         "chatTail":"... 用 shell 打印当前目录 已在沙箱中执行命令，输出为 hello-from-http。 ..."}
+                                                  → docs/screenshots/ui-06-hitl-approved.png
+
+服务端日志：
+[web] agui run thread=t-e44wm8ne run=155c4b60-... input=用 shell 打印当前目录
+[web] hitl resolved id=h2 decision=once
+[web] agui run done thread=t-e44wm8ne status=COMPLETED
+```
+
+时间线里能看到完整的一串：`CUSTOM_HITL_REQUESTED`(6) → `CUSTOM_HITL_RESOLVED`(7, decision=once)
+→ `TOOL_CALL_END`(8) → `STATE_SNAPSHOT`(9) → … → `RUN_FINISHED`(13)。
+
+## 这一段被测试逼出来的一个真缺陷
+
+`InteractiveHitlTest.timeoutAndAnswerRaceHasOneWinner` 一开始随机失败，断言
+"resolved 事件恰好一条"时读到 **0 条**。原因不是测试写错，是我的顺序写反了：
+
+```java
+// 错的：先唤醒等待者，再写日志
+if (!w.future.complete(decision)) return false;
+log.append(... resolved ...);
+```
+
+被唤醒的循环会**立刻继续跑**、立刻读会话日志（前端也会立刻刷新），
+于是存在一个"决定已生效、日志里却还没有"的窗口——审计最不该有的性质。
+
+改法是让仲裁与写日志分成两步：用 `AtomicBoolean` 争仲裁权，
+拿到之后 **先落事实 → 再改状态（放行表）→ 最后才唤醒**。
+
+```java
+if (!w.decided.compareAndSet(false, true)) return false;
+log.append(... resolved ...);          // ① 事实
+if (decision instanceof Always) { ... } // ② 状态
+w.future.complete(decision);            // ③ 唤醒
+```
+
+顺带说一句：这个竞态单跑一次通常碰不上，是"跑 40 次 + 断言不变量"的写法把它逼出来的。

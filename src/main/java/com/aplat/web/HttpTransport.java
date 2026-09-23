@@ -1,8 +1,11 @@
 package com.aplat.web;
 
+import com.aplat.hitl.InteractiveHitl;
+import com.aplat.hitl.PendingApproval;
 import com.aplat.kernel.Subscription;
 import com.aplat.loop.TurnResult;
 import com.aplat.run.Platform;
+import com.aplat.seam.HitlDecision;
 import com.aplat.seam.LlmAdapter;
 import com.aplat.seam.Sandbox;
 import com.aplat.seam.SessionEvent;
@@ -67,6 +70,14 @@ public final class HttpTransport implements AutoCloseable {
     private final UiAssets uiAssets;
     private final RateLimiter rateLimiter;
     private final AuditLog auditLog;
+    /**
+     * 交互式确认队列（U12）。为 null = 当前装配的 HITL 是自动实现（autoAllow/autoDeny）。
+     *
+     * <p>用 {@code instanceof} 而不是让 {@link com.aplat.seam.Hitl} 长出
+     * "查询待办 / 提交决定"两个方法：那两个操作只对"会停下来等人"的实现有意义，
+     * 塞进能力缝会让"自动放行"也得实现一堆空方法——能力缝应当只有一个真实的门控方法。
+     */
+    private final InteractiveHitl approvals;
     private final HttpServer server;
     private final ScheduledExecutorService heartbeat;
     private final Set<SseWriter> activeStreams = ConcurrentHashMap.newKeySet();
@@ -85,6 +96,7 @@ public final class HttpTransport implements AutoCloseable {
         this.auditLog = config.auditFile() == null
                 ? AuditLog.inMemory()
                 : AuditLog.toFile(java.nio.file.Path.of(config.auditFile()));
+        this.approvals = platform.hitl() instanceof InteractiveHitl interactive ? interactive : null;
         this.server = HttpServer.create(new InetSocketAddress(config.host(), config.port()), 0);
         // 每个请求一条虚拟线程：SSE 处理要长时间阻塞在等事件上，平台线程池会被瞬间占满
         this.server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
@@ -202,6 +214,10 @@ public final class HttpTransport implements AutoCloseable {
                 sendJson(ex, 200, toolsReport());
             } else if (path.equals("/audit") && method.equals("GET")) {
                 sendJson(ex, 200, auditReport(query(ex)));
+            } else if (path.equals("/hitl/pending") && method.equals("GET")) {
+                sendJson(ex, 200, pendingApprovals(query(ex)));
+            } else if (path.startsWith("/hitl/") && method.equals("POST")) {
+                handleApproval(ex, path.substring("/hitl/".length()));
             } else if (path.equals("/run") && method.equals("POST")) {
                 handleRun(ex);
             } else if (path.equals("/agui/run") && method.equals("POST")) {
@@ -569,6 +585,9 @@ public final class HttpTransport implements AutoCloseable {
         out.put("ui", uiAssets.available() ? "built" : "not built (run: cd ui && npm run build)");
         out.put("rateLimit", config.rateLimitEnabled()
                 ? config.rateLimitPerMin() + "/min per caller" : "disabled");
+        out.put("hitl", approvals == null
+                ? platform.hitl().id()
+                : platform.hitl().id() + " · " + approvals.pending().size() + " pending");
         out.put("audit", (auditLog.file() == null ? "memory only" : auditLog.file().toString())
                 + " · total=" + auditLog.total() + " dropped=" + auditLog.dropped());
         return out;
@@ -595,6 +614,128 @@ public final class HttpTransport implements AutoCloseable {
         out.put("tools", tools);
         out.put("count", tools.size());
         return out;
+    }
+
+    // -------------------------------------------------------- 人工确认面（U12/U13）
+
+    /**
+     * 待确认队列。
+     *
+     * <p>这是"人在另一个设备上"也能用的关键：{@code POST /run} 在等确认时会一直挂在那儿，
+     * 而任何一方都可以用它看到"现在有几条在等人、分别是什么"，再决定放不放。
+     */
+    private Map<String, Object> pendingApprovals(Map<String, String> q) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("interactive", approvals != null);
+        if (approvals == null) {
+            out.put("mode", "non-interactive");
+            out.put("count", 0);
+            out.put("pending", List.of());
+            out.put("note", "当前装配的 Hitl 实现不等人（autoAllow/autoDeny），没有待确认队列");
+            return out;
+        }
+        out.put("mode", approvals.mode().name().toLowerCase());
+        out.put("timeoutSec", approvals.timeout().toSeconds());
+
+        String sessionId = q.get("sessionId");
+        List<PendingApproval> list = sessionId == null || sessionId.isBlank()
+                ? approvals.pending()
+                : approvals.pendingFor(sessionId);
+
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (PendingApproval p : list) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("requestId", p.requestId());
+            row.put("sessionId", p.sessionId());
+            row.put("tool", p.toolName());
+            row.put("args", p.argumentsJson());
+            row.put("reason", p.reason());
+            row.put("requestedAt", p.requestedAt().toString());
+            row.put("expiresAt", p.expiresAt().toString());
+            row.put("remainingMs", p.remainingMillis());
+            rows.add(row);
+        }
+        out.put("count", rows.size());
+        out.put("pending", rows);
+        return out;
+    }
+
+    /**
+     * 提交一个人的决定。
+     *
+     * <p>四个可选值就是人在界面上能做的四件事：{@code once} / {@code always} / {@code deny} /
+     * {@code modify}。<b>没有 {@code timeout}</b>——那是"系统等不到人"的状态，
+     * 客户端不该有权伪造它（{@code InteractiveHitl.resolve} 会拒）。
+     *
+     * <p>过期或已答过返回 <b>409</b> 而不是 404：这条请求确实存在过，只是不再可答。
+     * 这个区别对前端有意义——409 时界面应当把卡片撤掉并提示"已超时"，而不是报错误。
+     */
+    private void handleApproval(HttpExchange ex, String rawRequestId) throws IOException {
+        if (approvals == null) {
+            sendError(ex, 501, "HITL_NOT_INTERACTIVE",
+                    "the assembled HITL implementation does not wait for humans; "
+                            + "start with " + InteractiveHitl.ENV_MODE + "=ask to enable approvals");
+            return;
+        }
+        String requestId = URLDecoder.decode(rawRequestId, StandardCharsets.UTF_8);
+        if (requestId.isBlank()) {
+            sendError(ex, 400, "MISSING_REQUEST_ID", "request id is required in path");
+            return;
+        }
+
+        String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        JsonNode node;
+        try {
+            node = MAPPER.readTree(body == null || body.isBlank() ? "{}" : body);
+        } catch (Exception e) {
+            sendError(ex, 400, "INVALID_JSON", "request body must be a JSON object");
+            return;
+        }
+
+        String kind = text(node, "decision");
+        if (kind == null) {
+            sendError(ex, 400, "MISSING_DECISION",
+                    "field 'decision' is required: once | always | deny | modify");
+            return;
+        }
+        kind = kind.trim().toLowerCase();
+
+        HitlDecision decision;
+        switch (kind) {
+            case "once", "approve", "allow" -> decision = new HitlDecision.Once();
+            case "always", "approve-always" -> decision = new HitlDecision.Always();
+            case "deny", "reject" -> {
+                String reason = text(node, "reason");
+                decision = new HitlDecision.Deny(reason == null || reason.isBlank()
+                        ? "denied by operator" : reason);
+            }
+            case "modify", "modified" -> {
+                String args = text(node, "arguments");
+                if (args == null || args.isBlank()) {
+                    sendError(ex, 400, "MISSING_ARGUMENTS",
+                            "decision=modify requires field 'arguments' (a JSON object)");
+                    return;
+                }
+                decision = new HitlDecision.Modified(args);
+            }
+            default -> {
+                sendError(ex, 400, "UNKNOWN_DECISION",
+                        "unknown decision '" + kind + "'; expected once | always | deny | modify");
+                return;
+            }
+        }
+
+        if (!approvals.resolve(requestId, decision)) {
+            sendError(ex, 409, "NOT_PENDING",
+                    "no pending approval '" + requestId + "' (already answered, expired, or unknown)");
+            return;
+        }
+        log("hitl resolved id=" + requestId + " decision=" + kind);
+        Map<String, Object> ok = new LinkedHashMap<>();
+        ok.put("requestId", requestId);
+        ok.put("decision", kind);
+        ok.put("accepted", true);
+        sendJson(ex, 200, ok);
     }
 
     /**

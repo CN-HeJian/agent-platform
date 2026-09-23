@@ -89,7 +89,12 @@ async function health(){
     const j = await r.json();
     $('healthDot').className = 'dot on';
     $('healthTxt').textContent = 'ok · ' + j.auth;
-    $('llmTxt').textContent = j.llm + ' · ' + j.sandbox;
+    // HITL 状态摆在明面上：这个控制台**没有审批 UI**。后端在等人时你会看到
+    // "发出去了但一直没回"——那不是卡死，是这里没法点批准。
+    const hitl = String(j.hitl || '');
+    $('llmTxt').textContent = j.llm + ' · ' + j.sandbox
+      + (hitl ? ' · ' + hitl : '')
+      + (hitl.includes('ask') ? ' ← 需批准时请到 /ui/ 或 /hitl/pending' : '');
   }catch(e){
     $('healthDot').className = 'dot off';
     $('healthTxt').textContent = '不可达';

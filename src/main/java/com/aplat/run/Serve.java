@@ -1,11 +1,11 @@
 package com.aplat.run;
 
+import com.aplat.hitl.InteractiveHitl;
 import com.aplat.llm.OpenAiCompatibleAdapter;
 import com.aplat.llm.ScriptedLlmAdapter;
 import com.aplat.loop.LoopBudget;
 import com.aplat.sandbox.DockerSandbox;
 import com.aplat.sandbox.ProcessSandbox;
-import com.aplat.seam.Hitl;
 import com.aplat.seam.LlmAdapter;
 import com.aplat.seam.Sandbox;
 import com.aplat.tools.DefaultToolPolicy;
@@ -28,6 +28,10 @@ import com.aplat.web.ServerConfig;
  *   # 换了端口 / 需要带 key
  *   export APLAT_HTTP_PORT=8080
  *   export APLAT_API_KEY=dev-secret
+ *
+ *   # 人工确认（U12）。默认就是 ask：能执行命令的服务，"先问"才是诚实的默认值
+ *   export APLAT_HITL=ask              # allow = 不问人直接放行；deny = 直接拒绝
+ *   export APLAT_HITL_TIMEOUT_SEC=120  # 无人应答的等待上限
  * </pre>
  *
  * 注意用 {@code exec:java@serve} 而不是 {@code -Dexec.mainClass}：POM 里显式配置的
@@ -55,8 +59,11 @@ public final class Serve {
                         .thenText("已在沙箱中执行命令，输出为 hello-from-http。")
                         .repeat();
 
-        Platform platform = Platform.assemble(llm, sandbox, Hitl.autoAllow(), LoopBudget.defaults(),
-                DefaultToolPolicy.fromEnv());
+        // HITL 走工厂：InteractiveHitl 要把 hitl.requested 写进会话日志，
+        // 而日志是内核建的——所以它只能在装配过程里被创建（见 Platform 的注释）。
+        Platform platform = Platform.assemble(llm, sandbox, LoopBudget.defaults(),
+                DefaultToolPolicy.fromEnv(),
+                log -> InteractiveHitl.fromEnv(log, System.getenv()));
 
         System.out.println("=== 装配清单 ===");
         System.out.println(platform.assemblyReport());
@@ -65,6 +72,7 @@ public final class Serve {
         }
         System.out.println("LLM     : " + llm.id() + (realModel ? "（真实服务）" : "（离线脚本）"));
         System.out.println("Sandbox : " + sandbox.description());
+        System.out.println("HITL    : " + platform.hitl().id());
 
         HttpTransport transport = new HttpTransport(platform, config).start();
         Runtime.getRuntime().addShutdownHook(new Thread(transport::close, "shutdown"));
@@ -76,6 +84,22 @@ public final class Serve {
             System.out.println("鉴权    : X-API-Key 已启用（/health 与 /ui/ 静态资源豁免）");
         } else {
             System.out.println("鉴权    : 未启用（仅监听 " + config.host() + "；对外暴露前请设 APLAT_API_KEY）");
+        }
+        if (platform.hitl() instanceof InteractiveHitl hitl) {
+            String keyArg = config.authEnabled() ? " -H 'X-API-Key: <你的key>'" : "";
+            if (hitl.mode() == InteractiveHitl.Mode.ASK) {
+                System.out.println("人工确认: 已开启 —— shell 这类工具执行前会停下来等人");
+                System.out.println("          网页上点批准，或者命令行：");
+                System.out.println("            curl -s" + keyArg + " " + base + "/hitl/pending");
+                System.out.println("            curl -s -X POST" + keyArg + " " + base + "/hitl/<requestId> \\");
+                System.out.println("                 -H 'Content-Type: application/json' -d '{\"decision\":\"once\"}'");
+                System.out.println("          " + hitl.timeout().toSeconds()
+                        + "s 内没人应答按超时处理（与「拒绝」不同：模型会被告知「人不在」）");
+                System.out.println("          本地想跳过这道门：APLAT_HITL=allow");
+            } else {
+                System.out.println("人工确认: " + hitl.mode().name().toLowerCase()
+                        + "（不问人，但仍会在会话日志里记一条 hitl.auto_approved）");
+            }
         }
         System.out.println();
         System.out.println("前端会话面 : " + base + "/ui/         ← CopilotKit（U07a）");

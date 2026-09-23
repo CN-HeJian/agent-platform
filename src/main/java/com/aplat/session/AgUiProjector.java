@@ -32,7 +32,8 @@ import java.util.Map;
  *       START）。所以返回的是列表，不是单条。</li>
  *   <li><b>内部记账事件不外泄</b>：{@code input.claimed}、{@code context.prepared} 是
  *       给回放排查用的，前端不需要看见——只有当某个事件确实无法归类时才走
- *       {@code CUSTOM}（协议允许，前端可安全忽略）。</li>
+ *       {@code CUSTOM}（协议允许，前端可安全忽略）。而人工确认那三条是**例外且必须外泄**：
+ *       界面要弹审批卡片，靠的就是它们。</li>
  *   <li><b>工具结果的内容 = 模型看到的那段文字</b>（含 {@code ERROR[code]} 前缀）。
  *       UI 上看到的和模型看到的一致，排查时不用两头对。</li>
  * </ol>
@@ -108,6 +109,23 @@ public final class AgUiProjector {
                     "snapshot", Map.of(
                             "step", String.valueOf(event.get("step")),
                             "messages", String.valueOf(event.get("messages")))));
+            // ---- 人工确认（U12）：这三条**必须**外泄，它们是"界面要弹卡片"的唯一信号。
+            //      AG-UI 的 CUSTOM 就是为这类领域事件准备的：名字与载荷自定义，
+            //      各客户端不认识的 CUSTOM 会安全忽略，不会破坏协议校验。
+            case SessionLog.EV_HITL_REQUEST -> out.add(custom("HITL_REQUESTED", Map.of(
+                    "requestId", String.valueOf(event.get("requestId")),
+                    "tool", String.valueOf(event.get("tool")),
+                    "args", String.valueOf(event.get("args")),
+                    "reason", String.valueOf(event.get("reason")),
+                    "timeoutSec", String.valueOf(event.get("timeoutSec")))));
+            case SessionLog.EV_HITL_RESOLVED -> out.add(custom("HITL_RESOLVED", Map.of(
+                    "requestId", String.valueOf(event.get("requestId")),
+                    "tool", String.valueOf(event.get("tool")),
+                    "decision", String.valueOf(event.get("decision")),
+                    "detail", String.valueOf(event.get("detail")))));
+            case SessionLog.EV_HITL_AUTO -> out.add(custom("HITL_AUTO_APPROVED", Map.of(
+                    "tool", String.valueOf(event.get("tool")),
+                    "reason", String.valueOf(event.get("reason")))));
             case SessionLog.EV_TURN_CLOSED -> {
                 closeMessage(out);
                 closeSteps(out);
@@ -196,6 +214,21 @@ public final class AgUiProjector {
         for (int i = 0; i + 1 < kv.length; i += 2) {
             out.put(String.valueOf(kv[i]), kv[i + 1]);
         }
+        return out;
+    }
+
+    /**
+     * AG-UI 的 {@code CUSTOM} 事件：{@code {type: "CUSTOM", name, value}}。
+     *
+     * <p>领域事件（人工确认就属于这类）用它，而不是自造一个顶层事件类型——
+     * 协议外的事件名会让严格的客户端在校验阶段就拒掉整条流，
+     * 而 {@code CUSTOM} 是协议明确允许、且约定"不认识就忽略"的扩展位。
+     */
+    private static Map<String, Object> custom(String name, Map<String, Object> value) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("type", "CUSTOM");
+        out.put("name", name);
+        out.put("value", value);
         return out;
     }
 }

@@ -72,24 +72,44 @@ public final class ToolPipeline {
                     decision.code() + ": " + decision.reason());
         }
 
-        // 4. 人工确认
+        // 4. 人工确认（U12）。四种决策各自对应不同后果，所以这里必须分开处理——
+        //    把 deny 当"重试"、把 timeout 当"反对"，模型都会做出错误的下一步。
         String effectiveArgs = call.argumentsJson();
         if (tool.approvalRequired()) {
             HitlDecision d = hitl.request(new HitlRequest(
-                    sessionId, call.name(), effectiveArgs, "tool requires human approval", null));
+                    sessionId, call.name(), effectiveArgs, approvalReason(tool.spec()), null));
             switch (d) {
                 case HitlDecision.Deny deny -> {
+                    // 拒绝不是失败终止：当成观察回填，模型有能力换个做法（U13）
                     return ToolResult.error(ToolResult.ERR_DENIED,
                             "user denied execution: " + deny.reason() + ". try another approach.");
                 }
                 case HitlDecision.Timeout ignored -> {
+                    // 与 DENIED 分开：这里的语义是"人不在"，不是"人反对"
                     return ToolResult.error(ToolResult.ERR_TIMEOUT,
                             "no human response in time. abort this action and continue without it.");
                 }
-                case HitlDecision.Modified m -> effectiveArgs = m.newArgumentsJson();
                 case HitlDecision.Once ignored -> {
                 }
                 case HitlDecision.Always ignored -> {
+                    // "本会话内同类放行"已经记在 Hitl 实现里——只有它才有会话级视图。
+                    // 这里刻意不再存一份状态：两份状态迟早会不一致。
+                }
+                case HitlDecision.Modified m -> {
+                    // 改过的参数必须当成**新参数**重新过闸。
+                    // 否则"人把命令改掉"就成了绕过策略的后门：批的是 "echo hi"、执行的是 "rm -rf /"。
+                    // 用户的意图可信，但参数本身仍需校验——这是两件事。
+                    if (!Json.isValidObject(m.newArgumentsJson())) {
+                        return ToolResult.error(ToolResult.ERR_INVALID_ARGS,
+                                "modified arguments must be a JSON object, got: " + m.newArgumentsJson());
+                    }
+                    ToolPolicy.Decision recheck = policy.check(sessionId, tool.spec(), m.newArgumentsJson());
+                    if (!recheck.allowed()) {
+                        return ToolResult.error(ToolResult.ERR_BLOCKED,
+                                "modified arguments rejected by policy: " + recheck.code()
+                                        + ": " + recheck.reason());
+                    }
+                    effectiveArgs = m.newArgumentsJson();
                 }
             }
         }
@@ -101,5 +121,17 @@ public final class ToolPipeline {
             return ToolResult.error(ToolResult.ERR_SANDBOX,
                     "tool threw " + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
+    }
+
+    /**
+     * 给人工确认请求写一句人能看懂的理由。
+     *
+     * <p>屏幕上只写 "tool requires human approval" 是在浪费这次打扰——人被问到时唯一想知道的
+     * 就是"这玩意儿会动什么"。所以这里把"哪个参数会被当命令跑"直接说出来。
+     */
+    private static String approvalReason(com.aplat.seam.ToolSpec spec) {
+        return spec.executesCommands()
+                ? "工具 " + spec.name() + " 会执行命令（参数 " + spec.commandField() + "）"
+                : "工具 " + spec.name() + " 声明需要人工确认";
     }
 }

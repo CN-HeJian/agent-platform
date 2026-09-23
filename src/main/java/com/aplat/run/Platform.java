@@ -40,12 +40,15 @@ public final class Platform {
     private final Kernel kernel;
     private final AgentLoop loop;
     private final SessionLog sessionLog;
+    private final Hitl hitl;
     private final List<String> policyWarnings;
 
-    private Platform(Kernel kernel, AgentLoop loop, SessionLog sessionLog, List<String> policyWarnings) {
+    private Platform(Kernel kernel, AgentLoop loop, SessionLog sessionLog, Hitl hitl,
+                     List<String> policyWarnings) {
         this.kernel = kernel;
         this.loop = loop;
         this.sessionLog = sessionLog;
+        this.hitl = hitl;
         this.policyWarnings = List.copyOf(policyWarnings);
     }
 
@@ -62,15 +65,43 @@ public final class Platform {
      */
     public static Platform assemble(LlmAdapter llm, Sandbox sandbox, Hitl hitl, LoopBudget budget,
                                     ToolPolicy policy) {
+        return build(llm, sandbox, budget, policy, log -> hitl);
+    }
+
+    /**
+     * 带 <b>HITL 工厂</b>的装配。
+     *
+     * <p>存在的唯一理由是个先后问题：{@link com.aplat.hitl.InteractiveHitl} 要把
+     * {@code hitl.requested} 写进**会话日志**，而会话日志是内核在建时创建的——
+     * 它没法先于内核被 new 出来。
+     *
+     * <p>把工厂参数放在装配根里，是为了不让这个顺序依赖渗到别处
+     * （比如"先 new 一个空的再回填"那种延迟注入，一旦有人提前用就会静默 NPE）。
+     * 业务代码完全不需要知道这里发生过什么。
+     */
+    public static Platform assemble(LlmAdapter llm, Sandbox sandbox, LoopBudget budget,
+                                    ToolPolicy policy,
+                                    java.util.function.Function<SessionLog, Hitl> hitlFactory) {
+        return build(llm, sandbox, budget, policy, hitlFactory);
+    }
+
+    private static Platform build(LlmAdapter llm, Sandbox sandbox, LoopBudget budget,
+                                  ToolPolicy policy,
+                                  java.util.function.Function<SessionLog, Hitl> hitlFactory) {
         ToolRegistry tools = new DefaultToolRegistry();
         BuiltinTools.registerAll(tools);
         tools.register(new ShellTool(sandbox).build());
 
         List<String> warnings = DefaultToolPolicy.lint(tools);
 
-        Kernel kernel = Kernel.builder()
+        // 先把内核的骨架立起来（Store + SessionLog），才有日志可交给 HITL 工厂
+        Kernel.Builder kb = Kernel.builder()
                 .bind(Store.class, new InMemoryStore())
-                .withDefaults()
+                .withDefaults();
+
+        Hitl hitl = hitlFactory.apply(kb.sessionLog());
+
+        Kernel kernel = kb
                 .bind(LlmAdapter.class, llm)
                 .bind(ToolRegistry.class, tools)
                 .bind(Sandbox.class, sandbox)
@@ -87,12 +118,24 @@ public final class Platform {
                 budget,
                 DEFAULT_SYSTEM_PROMPT);
 
-        return new Platform(kernel, loop, kernel.ctx().get(SessionLog.class), warnings);
+        return new Platform(kernel, loop, kernel.ctx().get(SessionLog.class), hitl, warnings);
     }
 
     /** 装配期发现的安全隐患（空列表 = 干净）。启动时应当打出来。 */
     public List<String> policyWarnings() {
         return policyWarnings;
+    }
+
+    /**
+     * 当前装配的 HITL 实现。
+     *
+     * <p>暴露它的原因很实在：传输层要提供"待确认队列"和"提交决定"两个端点，
+     * 而这两件事只有具体的 HITL 实现知道怎么做（{@link Hitl} 本身刻意只有一个
+     * 阻塞式 {@code request}）。调用方应当用 {@code instanceof} 判断能力，
+     * 而不是假定它一定是哪一种。
+     */
+    public Hitl hitl() {
+        return hitl;
     }
 
     public AgentLoop loop() {
