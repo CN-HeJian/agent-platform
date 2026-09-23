@@ -1,6 +1,7 @@
 package com.aplat.run;
 
 import com.aplat.hitl.InteractiveHitl;
+import com.aplat.hitl.ScopedHitl;
 import com.aplat.llm.OpenAiCompatibleAdapter;
 import com.aplat.llm.ScriptedLlmAdapter;
 import com.aplat.loop.LoopBudget;
@@ -82,9 +83,17 @@ public final class Serve {
 
         // HITL 走工厂：InteractiveHitl 要把 hitl.requested 写进会话日志，
         // 而日志是内核建的——所以它只能在装配过程里被创建（见 Platform 的注释）。
+        // HITL 外面再套一层 ScopedHitl：定时任务可以带一份"提前批准"的豁免名单（U22），
+        // 而那份名单只在那条调度自己的线程上有效。不套的话，调度里"提前批准"根本无处生效。
         Platform platform = Platform.assemble(llm, sandbox, LoopBudget.defaults(),
                 DefaultToolPolicy.fromEnv(), store,
-                log -> InteractiveHitl.fromEnv(log, System.getenv()));
+                log -> new ScopedHitl(InteractiveHitl.fromEnv(log, System.getenv()), log));
+
+        // 启动顺序（U22）：先认领孤儿，再开调度。
+        // 反过来的话，一条上次崩在跑的任务会被调度器看成"还在跑"，
+        // 于是那条调度被白白跳过一整轮——而原因在任何日志里都看不到。
+        int reclaimed = platform.durable().reclaimOrphans();
+        platform.scheduler().start();
 
         System.out.println("=== 装配清单 ===");
         System.out.println(platform.assemblyReport());
@@ -95,6 +104,11 @@ public final class Serve {
         System.out.println("Sandbox : " + sandbox.description());
         System.out.println("HITL    : " + platform.hitl().id());
         System.out.println("Store   : " + describeStore(store));
+        System.out.println("耐久    : 任务 "
+                + platform.durable().list().size() + " 条"
+                + (reclaimed > 0 ? "，启动时认领孤儿 " + reclaimed + " 条（可续跑）" : "")
+                + "；调度 " + platform.scheduler().list().size() + " 条（每 "
+                + platform.scheduler().tickMillis() / 1000 + "s 扫一次）");
 
         HttpTransport transport = new HttpTransport(platform, config).start();
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -110,7 +124,7 @@ public final class Serve {
         } else {
             System.out.println("鉴权    : 未启用（仅监听 " + config.host() + "；对外暴露前请设 APLAT_API_KEY）");
         }
-        if (platform.hitl() instanceof InteractiveHitl hitl) {
+        if (ScopedHitl.unwrap(platform.hitl()) instanceof InteractiveHitl hitl) {
             String keyArg = config.authEnabled() ? " -H 'X-API-Key: <你的key>'" : "";
             if (hitl.mode() == InteractiveHitl.Mode.ASK) {
                 System.out.println("人工确认: 已开启 —— shell 这类工具执行前会停下来等人");

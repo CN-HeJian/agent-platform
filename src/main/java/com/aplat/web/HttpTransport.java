@@ -1,6 +1,7 @@
 package com.aplat.web;
 
 import com.aplat.hitl.InteractiveHitl;
+import com.aplat.hitl.ScopedHitl;
 import com.aplat.hitl.PendingApproval;
 import com.aplat.kernel.Subscription;
 import com.aplat.loop.TurnResult;
@@ -10,6 +11,9 @@ import com.aplat.seam.LlmAdapter;
 import com.aplat.seam.Sandbox;
 import com.aplat.seam.SessionEvent;
 import com.aplat.seam.Tool;
+import com.aplat.durable.TaskRecord;
+import com.aplat.schedule.ScheduleSpec;
+import com.aplat.schedule.Trigger;
 import com.aplat.seam.SessionLog;
 import com.aplat.session.AgUiProjector;
 import com.aplat.tools.Json;
@@ -96,7 +100,11 @@ public final class HttpTransport implements AutoCloseable {
         this.auditLog = config.auditFile() == null
                 ? AuditLog.inMemory()
                 : AuditLog.toFile(java.nio.file.Path.of(config.auditFile()));
-        this.approvals = platform.hitl() instanceof InteractiveHitl interactive ? interactive : null;
+        // 必须拆包：Serve 把 InteractiveHitl 套进了 ScopedHitl（U22 的提前批准），
+        // 不拆的话 instanceof 不成立，审批面板会显示成"当前实现不等人"——
+        // 一个纯粹的包装层把功能"关掉"了，而且没有任何报错。
+        this.approvals = ScopedHitl.unwrap(platform.hitl()) instanceof InteractiveHitl interactive
+                ? interactive : null;
         this.server = HttpServer.create(new InetSocketAddress(config.host(), config.port()), 0);
         // 每个请求一条虚拟线程：SSE 处理要长时间阻塞在等事件上，平台线程池会被瞬间占满
         this.server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
@@ -218,6 +226,18 @@ public final class HttpTransport implements AutoCloseable {
                 sendJson(ex, 200, pendingApprovals(query(ex)));
             } else if (path.startsWith("/hitl/") && method.equals("POST")) {
                 handleApproval(ex, path.substring("/hitl/".length()));
+            } else if (path.equals("/tasks") && method.equals("GET")) {
+                sendJson(ex, 200, tasksReport());
+            } else if (path.startsWith("/tasks/") && method.equals("POST")) {
+                handleTaskAction(ex, path.substring("/tasks/".length()));
+            } else if (path.equals("/schedules") && method.equals("GET")) {
+                sendJson(ex, 200, schedulesReport());
+            } else if (path.equals("/schedules") && method.equals("POST")) {
+                handleCreateSchedule(ex);
+            } else if (path.startsWith("/schedules/") && method.equals("DELETE")) {
+                handleDeleteSchedule(ex, path.substring("/schedules/".length()));
+            } else if (path.startsWith("/schedules/") && method.equals("POST")) {
+                handleScheduleAction(ex, path.substring("/schedules/".length()));
             } else if (path.equals("/run") && method.equals("POST")) {
                 handleRun(ex);
             } else if (path.equals("/agui/run") && method.equals("POST")) {
@@ -626,6 +646,222 @@ public final class HttpTransport implements AutoCloseable {
      * <p>这是"人在另一个设备上"也能用的关键：{@code POST /run} 在等确认时会一直挂在那儿，
      * 而任何一方都可以用它看到"现在有几条在等人、分别是什么"，再决定放不放。
      */
+    // ------------------------------------------------------ U19/U22 任务与调度面
+
+    /** 任务列表。默认只看未结束的：`?all=1` 看全部。 */
+    private Map<String, Object> tasksReport() {
+        List<TaskRecord> all = platform.durable().list();
+        List<Map<String, Object>> active = new ArrayList<>();
+        List<Map<String, Object>> done = new ArrayList<>();
+        for (TaskRecord t : all) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("taskId", t.taskId());
+            row.put("sessionId", t.sessionId());
+            row.put("goal", t.goal());
+            row.put("state", t.state().name());
+            row.put("step", t.step());
+            row.put("attempts", t.attempts());
+            row.put("detail", t.detail());
+            row.put("updatedAt", t.updatedAt());
+            row.put("resumable", t.state().resumable());
+            (t.state().terminal() ? done : active).add(row);
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("count", all.size());
+        out.put("active", active);
+        out.put("terminal", done);
+        out.put("note", "RUNNING 表示执行者已经不在了（重启时会被认领成 CRASHED，然后可以续跑）");
+        return out;
+    }
+
+    /** {@code POST /tasks/{id}/resume} 或 {@code /tasks/{id}/cancel}。 */
+    private void handleTaskAction(HttpExchange ex, String raw) throws IOException {
+        String tail = URLDecoder.decode(raw, StandardCharsets.UTF_8);
+        int slash = tail.lastIndexOf('/');
+        if (slash <= 0) {
+            sendError(ex, 400, "BAD_TASK_PATH", "expected /tasks/<taskId>/resume or /cancel");
+            return;
+        }
+        String taskId = tail.substring(0, slash);
+        String action = tail.substring(slash + 1);
+        try {
+            TaskRecord out = switch (action) {
+                case "resume" -> platform.durable().resume(taskId);
+                case "cancel" -> platform.durable().cancel(taskId);
+                case "suspend" -> platform.durable().suspend(taskId);
+                default -> null;
+            };
+            if (out == null) {
+                sendError(ex, 400, "UNKNOWN_ACTION",
+                        "unknown task action '" + action + "' (resume / suspend / cancel)");
+                return;
+            }
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("taskId", out.taskId());
+            body.put("state", out.state().name());
+            body.put("step", out.step());
+            body.put("attempts", out.attempts());
+            body.put("detail", out.detail());
+            sendJson(ex, 200, body);
+        } catch (IllegalArgumentException e) {
+            sendError(ex, 404, "NO_SUCH_TASK", e.getMessage());
+        } catch (IllegalStateException e) {
+            // 终态不重跑、以及其它"状态不允许"，都是 409：请求本身没错，是时机不对
+            sendError(ex, 409, "TASK_NOT_ACTIONABLE", e.getMessage());
+        }
+    }
+
+    private Map<String, Object> schedulesReport() {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (ScheduleSpec spec : platform.scheduler().list()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("scheduleId", spec.scheduleId());
+            row.put("goal", spec.goal());
+            row.put("sessionId", spec.sessionId());
+            row.put("trigger", spec.trigger().describe());
+            row.put("enabled", spec.enabled());
+            row.put("nextRunAt", spec.nextRunAt());
+            row.put("lastRunAt", spec.lastRunAt());
+            row.put("lastTaskId", spec.lastTaskId());
+            row.put("lastOutcome", spec.lastOutcome());
+            row.put("runCount", spec.runCount());
+            row.put("preApprovedTools", spec.preApprovedTools());
+            rows.add(row);
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("count", rows.size());
+        out.put("ticking", platform.scheduler().started());
+        out.put("tickMillis", platform.scheduler().tickMillis());
+        out.put("schedules", rows);
+        out.put("note", "错过的触发不会补跑；preApprovedTools 里的工具到点免人工确认");
+        return out;
+    }
+
+    /**
+     * {@code POST /schedules} —— 建一条调度。
+     *
+     * <pre>
+     * {"goal":"跑日报","sessionId":"s1","trigger":{"kind":"interval","seconds":300},
+     *  "preApprovedTools":[]}
+     * {"goal":"...","trigger":{"kind":"daily","hhmm":"02:30"}}
+     * {"goal":"...","trigger":{"kind":"once","atMillis":1790000000000}}
+     * </pre>
+     */
+    private void handleCreateSchedule(HttpExchange ex) throws IOException {
+        JsonNode root = readObject(ex);
+        if (root == null) {
+            return;
+        }
+        String goal = root.path("goal").asText("");
+        if (goal.isBlank()) {
+            sendError(ex, 400, "MISSING_GOAL", "goal is required (a schedule with no goal does nothing)");
+            return;
+        }
+        String sessionId = root.path("sessionId").asText("s-scheduled");
+
+        Trigger trigger;
+        try {
+            JsonNode t = root.path("trigger");
+            trigger = switch (t.path("kind").asText("")) {
+                case "interval" -> new Trigger.Interval(t.path("seconds").asLong());
+                case "daily" -> t.hasNonNull("zone")
+                        ? new Trigger.Daily(t.path("hhmm").asText(), java.time.ZoneId.of(t.path("zone").asText()))
+                        : Trigger.Daily.of(t.path("hhmm").asText());
+                case "once" -> new Trigger.Once(t.path("atMillis").asLong());
+                default -> null;
+            };
+        } catch (Exception e) {
+            sendError(ex, 400, "BAD_TRIGGER", e.getMessage());
+            return;
+        }
+        if (trigger == null) {
+            sendError(ex, 400, "BAD_TRIGGER",
+                    "trigger.kind must be once / interval / daily（不做 cron 表达式，见 Trigger 的注释）");
+            return;
+        }
+
+        List<String> pre = new ArrayList<>();
+        root.path("preApprovedTools").forEach(n -> pre.add(n.asText()));
+
+        try {
+            var created = platform.scheduler().create(goal, sessionId, trigger, pre);
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("scheduleId", created.spec().scheduleId());
+            body.put("nextRunAt", created.spec().nextRunAt());
+            body.put("trigger", created.spec().trigger().describe());
+            // 警告随 201 一起回：建的时候就得让人看见"你批了一个执行类工具"
+            body.put("warnings", created.warnings());
+            sendJson(ex, 201, body);
+        } catch (IllegalArgumentException e) {
+            sendError(ex, 400, "BAD_SCHEDULE", e.getMessage());
+        }
+    }
+
+    private void handleDeleteSchedule(HttpExchange ex, String rawId) throws IOException {
+        String id = URLDecoder.decode(rawId, StandardCharsets.UTF_8);
+        if (platform.scheduler().remove(id)) {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("scheduleId", id);
+            body.put("removed", true);
+            sendJson(ex, 200, body);
+        } else {
+            sendError(ex, 404, "NO_SUCH_SCHEDULE", "no schedule named " + id);
+        }
+    }
+
+    /** {@code POST /schedules/{id}/run-now} 或 {@code /enable} / {@code /disable}。 */
+    private void handleScheduleAction(HttpExchange ex, String raw) throws IOException {
+        String tail = URLDecoder.decode(raw, StandardCharsets.UTF_8);
+        int slash = tail.lastIndexOf('/');
+        if (slash <= 0) {
+            sendError(ex, 400, "BAD_SCHEDULE_PATH", "expected /schedules/<id>/run-now|enable|disable");
+            return;
+        }
+        String id = tail.substring(0, slash);
+        String action = tail.substring(slash + 1);
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            switch (action) {
+                case "run-now" -> {
+                    TaskRecord t = platform.scheduler().runNow(id);
+                    body.put("taskId", t.taskId());
+                    body.put("state", t.state().name());
+                    body.put("detail", t.detail());
+                }
+                case "enable", "disable" -> {
+                    ScheduleSpec spec = platform.scheduler().setEnabled(id, action.equals("enable"));
+                    body.put("scheduleId", spec.scheduleId());
+                    body.put("enabled", spec.enabled());
+                    body.put("nextRunAt", spec.nextRunAt());
+                }
+                default -> {
+                    sendError(ex, 400, "UNKNOWN_ACTION",
+                            "unknown schedule action '" + action + "' (run-now / enable / disable)");
+                    return;
+                }
+            }
+            sendJson(ex, 200, body);
+        } catch (IllegalArgumentException e) {
+            sendError(ex, 404, "NO_SUCH_SCHEDULE", e.getMessage());
+        }
+    }
+
+    /** 读一个 JSON 对象；不是对象就回 400 并返回 null。 */
+    private JsonNode readObject(HttpExchange ex) throws IOException {
+        String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        try {
+            JsonNode node = MAPPER.readTree(body == null || body.isBlank() ? "{}" : body);
+            if (node == null || !node.isObject()) {
+                sendError(ex, 400, "INVALID_JSON", "request body must be a JSON object");
+                return null;
+            }
+            return node;
+        } catch (Exception e) {
+            sendError(ex, 400, "INVALID_JSON", "request body must be a JSON object");
+            return null;
+        }
+    }
+
     private Map<String, Object> pendingApprovals(Map<String, String> q) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("interactive", approvals != null);

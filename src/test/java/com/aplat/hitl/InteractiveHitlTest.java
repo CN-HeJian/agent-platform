@@ -44,6 +44,30 @@ class InteractiveHitlTest {
         return ((EventSourcedSessionLog) log).ofType(sessionId, type).size();
     }
 
+    @Test
+    @DisplayName("构造处的零与 null 是两个意思：零 = 不等待，null = 用默认（同一层里不能有两个零）")
+    void zeroMeansDoNotWaitAndNullMeansDefault() {
+        assertEquals(InteractiveHitl.DEFAULT_TIMEOUT,
+                new InteractiveHitl(log, InteractiveHitl.Mode.ASK, null).timeout(),
+                "null 才是「没配，用默认」");
+        assertTrue(new InteractiveHitl(log, InteractiveHitl.Mode.ASK, Duration.ZERO).timeout().isZero(),
+                "零表示不等待。它曾经被解释成「用默认」，于是读 seam 文档写 Duration.ZERO 的人"
+                        + "会莫名其妙等满 120 秒");
+        assertTrue(new InteractiveHitl(log, InteractiveHitl.Mode.ASK, Duration.ofSeconds(-3))
+                .timeout().isZero(), "负数同样当「不等待」，不抛");
+
+        long t0 = System.nanoTime();
+        HitlDecision d = hitl(Duration.ZERO).request(req("s1", "shell", "{}"));
+        assertInstanceOf(HitlDecision.Timeout.class, d);
+        long ms = Duration.ofNanos(System.nanoTime() - t0).toMillis();
+        assertTrue(ms < 1000, "「不等待」就该立刻返回，实际等了 " + ms + "ms");
+
+        // 但不等待 ≠ 不留痕：requested/resolved 一对仍然要落，否则审计里出现无法解释的空档
+        assertEquals(1, count("s1", SessionLog.EV_HITL_REQUEST));
+        assertEquals(1, count("s1", SessionLog.EV_HITL_RESOLVED));
+        assertEquals(0, hitl(Duration.ZERO).pending().size(), "不等待的请求不该进 pending 队列");
+    }
+
     /** 等它真的进队列——用轮询而不是 sleep 猜时间。 */
     private static void awaitPending(InteractiveHitl h, int expected) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 3_000;

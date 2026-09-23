@@ -12,6 +12,7 @@ import com.aplat.seam.Hitl;
 import com.aplat.seam.LlmAdapter;
 import com.aplat.seam.Sandbox;
 import com.aplat.seam.SessionLog;
+import com.aplat.schedule.Scheduler;
 import com.aplat.seam.Store;
 import com.aplat.seam.ToolRegistry;
 import com.aplat.store.InMemoryStore;
@@ -47,10 +48,12 @@ public final class Platform implements AutoCloseable {
     private final Store store;
     private final DurableRunner durable;
     private final ToolRegistry tools;
+    private final Scheduler scheduler;
     private final List<String> policyWarnings;
 
     private Platform(Kernel kernel, AgentLoop loop, SessionLog sessionLog, Hitl hitl, Store store,
-                     DurableRunner durable, ToolRegistry tools, List<String> policyWarnings) {
+                     DurableRunner durable, ToolRegistry tools, Scheduler scheduler,
+                     List<String> policyWarnings) {
         this.kernel = kernel;
         this.loop = loop;
         this.sessionLog = sessionLog;
@@ -58,6 +61,7 @@ public final class Platform implements AutoCloseable {
         this.store = store;
         this.durable = durable;
         this.tools = tools;
+        this.scheduler = scheduler;
         this.policyWarnings = List.copyOf(policyWarnings);
     }
 
@@ -170,8 +174,12 @@ public final class Platform implements AutoCloseable {
                 new StoreIdempotency(store));
 
         DurableRunner durable = new DurableRunner(loop, store, checkpointer);
+
+        // 调度（U22）：装配期只建对象，**不**自动开始轮询。
+        // 由显式的 start() 打开——测试与一次性命令不该在背后有个定时线程在跑。
+        Scheduler scheduler = new Scheduler(durable, store, kernel.ctx().get(SessionLog.class), tools);
         return new Platform(kernel, loop, kernel.ctx().get(SessionLog.class), hitl, store,
-                durable, tools, warnings);
+                durable, tools, scheduler, warnings);
     }
 
     /**
@@ -182,6 +190,8 @@ public final class Platform implements AutoCloseable {
      */
     @Override
     public void close() {
+        // 调度器先停：它的 tick 线程会碰 store，把 store 关了它还在跑就会刷一屏异常。
+        scheduler.close();
         if (store instanceof AutoCloseable closable) {
             try {
                 closable.close();
@@ -204,6 +214,16 @@ public final class Platform implements AutoCloseable {
      */
     public DurableRunner durable() {
         return durable;
+    }
+
+    /**
+     * 调度器（U22）。
+     *
+     * <p>启动顺序有讲究：**先 {@code durable().reclaimOrphans()}，再 {@code scheduler().start()}**。
+     * 反过来的话，一条上次崩在跑的任务会被调度器看成"还在跑"，于是那句调度被跳过一整轮。
+     */
+    public Scheduler scheduler() {
+        return scheduler;
     }
 
     /** 已注册的工具表。给"运行中还想加个工具"的场景与测试用（U30）。 */

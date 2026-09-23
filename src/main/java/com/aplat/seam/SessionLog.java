@@ -61,5 +61,22 @@ public interface SessionLog extends Seam {
     String EV_TOOL_REPLAYED = "tool.replayed";
     /** 耐久任务的状态迁移（U19）。任务的"一生"在时间线里也应当是可见的。 */
     String EV_TASK_STATE = "task.state";
+    /** 调度到点触发（U22）。 */
+    String EV_SCHEDULE_FIRED = "schedule.fired";
+    /**
+     * 调度到点但被跳过（U22）。
+     *
+     * <p>跳过**必须**留痕：不记的话，一条"因为上一次还没跑完而一直被跳过"的调度
+     * 在日志里就是"什么都没发生"——而它其实是坏的，且是安静地坏着。
+     */
+    String EV_SCHEDULE_SKIPPED = "schedule.skipped";
+    /**
+     * 由调度提前批准而放行（U22）。
+     *
+     * <p>与 {@link #EV_HITL_AUTO} 分开：auto 是"部署成不问人"（APLAT_HITL=allow），
+     * 这条是"某条调度事先授权了某个工具"。少了它，"凌晨两点跑了一个命令"与
+     * "凌晨两点有人批了一个命令"在日志里长得一样。
+     */
+    String EV_HITL_PREAPPROVED = "hitl.pre_approved";
     String EV_ERROR = "error";
 }

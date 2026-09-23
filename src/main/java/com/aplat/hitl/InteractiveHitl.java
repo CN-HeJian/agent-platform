@@ -95,12 +95,22 @@ public final class InteractiveHitl implements Hitl {
     private final Map<String, Set<String>> sessionAllowlist = new ConcurrentHashMap<>();
     private final AtomicLong counter = new AtomicLong();
 
+    /**
+     * @param timeout 无人应答的等待上限。
+     *                <b>null = 用 {@link #DEFAULT_TIMEOUT}</b>；
+     *                <b>{@code Duration.ZERO} = 不等待</b>（判定为超时后立即返回，
+     *                但仍会往会话日志里记一对 requested/resolved，不是静默放过）。
+     *
+     *                <p>这里刻意**不**把零解释成"用默认"——虽然看起来更宽容，但那会让
+     *                seam 文档里"零或负数表示不等待"（见 {@code HitlRequest#timeout}）
+     *                在实现层失效：调用方写 {@code Duration.ZERO} 表达"别等"，
+     *                实际却等了两分钟。同一个值在相邻两层有两个意思是最糟的接口。
+     *                要"用默认"就传 {@code null}——它是明确的。
+     */
     public InteractiveHitl(SessionLog log, Mode mode, Duration timeout) {
         this.log = log;
         this.mode = mode == null ? Mode.ASK : mode;
-        this.timeout = timeout == null || timeout.isZero() || timeout.isNegative()
-                ? DEFAULT_TIMEOUT
-                : timeout;
+        this.timeout = timeout == null ? DEFAULT_TIMEOUT : timeout.isNegative() ? Duration.ZERO : timeout;
     }
 
     public static InteractiveHitl fromEnv(SessionLog log, Map<String, String> env) {
