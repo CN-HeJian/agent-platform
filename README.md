@@ -22,6 +22,10 @@
 | OpenAI 兼容适配器（D1） | `llm/OpenAiCompatibleAdapter` | ✅ 零 SDK 依赖 |
 | **MySQL 持久化（U18）** | `store/JdbcStore` + `store/StoreFactory` | ✅ 同一份 SQL 跑 MySQL / H2；事件、快照、幂等键重启不丢 |
 | 内存 Store（MySQL 的契约参照） | `store/InMemoryStore` | ✅ 不配数据库就是它，零外部依赖 |
+| 命名空间键值（任务的落地方式） | `Store#put/get/all/remove` | ✅ 三个实现同契约，含 20 万字符大值 |
+| **耐久任务状态机（U19）** | `durable/DurableRunner` + `TaskState` | ✅ 七态；启动认领孤儿，终态不重跑 |
+| **断点续跑（U20）** | `durable/StoreCheckpointer` + `AgentLoop#resume` | ✅ 检查点存**完整消息**，从下一步接上 |
+| **副作用幂等（U21）** | `durable/StoreIdempotency` | ✅ 三种崩点分别可验证；结果未知时**不重跑** |
 | 装配根 | `run/Platform` | ✅ |
 | **HTTP + SSE 传输层（U02）** | `web/` | ✅ 零新增依赖（JDK HttpServer + 虚拟线程） |
 | **AG-UI 规范端点（U08）** | `session/AgUiProjector` + `POST /agui/run` | ✅ 事件形状符合规范，客户端可直连 |
@@ -33,8 +37,8 @@
 | **工具卡片 + 过程时间线（U07b）** | `ui/src/ToolCard.tsx` · `ui/src/Timeline.tsx` | ✅ 工具参数/结果可视化；原始事件实时可见 |
 | **人工确认 HITL（U12/U13）** | `hitl/InteractiveHitl` + `ui/src/ApprovalPanel.tsx` | ✅ once / always / deny / modify / timeout 五条路径，全程留痕 |
 
-**尚未做**（按计划属后续需求单元）：MCP 接入（U24）、耐久状态机（U19/U20）、
-RBAC（U25）、多模态与协作（U27+）、可观测台（U23）。
+**尚未做**（按计划属后续需求单元）：调度（U22）、可观测台（U23）、MCP 接入（U24）、
+RBAC 与密钥（U25）、容器化（U26）、评测飞轮（U27/U28）、平台化（U29–U33）。
 
 ---
 
@@ -227,6 +231,63 @@ export APLAT_DB_USER=root APLAT_DB_PASSWORD=
 **取号不读 `MAX(seq)`**：并发下两个事务都会读到 5、都想写 6。这里用
 `INSERT ... ON DUPLICATE KEY UPDATE next_seq = next_seq + 1` 一条语句完成"有则加一、无则建一"，
 再用同一个事务读回——这一行会锁到提交为止，于是**同一会话的取号天然串行，不同会话互不影响**。
+
+### 耐久：任务状态机 + 断点续跑 + 副作用至多一次（U19 + U20 + U21）
+
+`kill -9` 之后不再是从零重来。三层机制，各解决一件事：
+
+| 层 | 类 | 解决的问题 |
+|---|---|---|
+| 状态机 | `durable/TaskState` + `DurableRunner` | 「这条任务现在算什么状态、能不能再跑」 |
+| 检查点 | `durable/StoreCheckpointer` | 「续跑从第几步接、模型醒来看到什么上下文」 |
+| 幂等闸 | `durable/StoreIdempotency` | 「崩在副作用之后，续跑会不会做第二遍」 |
+
+**状态是写下来的事实，不是算出来的。** `DurableRunner.start()` 先落 `RUNNING` 再干活，
+于是"库里有一条 `RUNNING`"就等价于"它的执行者已经不在了"——这就是启动时
+`reclaimOrphans()` 认领孤儿的依据（改成 `CRASHED`，从而可续跑）。
+反过来（成功后再写 `RUNNING`）会丢掉整个机制的意义：崩在活干到一半时库里还是 `PENDING`，
+那意味着**没人知道它动过手脚**。
+
+**检查点存的是完整消息列表，不是步号。** 只记步号的话，续跑等于让模型失忆重来，
+那还不如不恢复。检查点按 `taskId` 而不是 `sessionId` 索引——同一个会话可以先后跑多个任务，
+用会话做键会让任务 B 读到任务 A 的检查点，而这种错在日志里表现为"模型突然开始说另一件事"。
+
+**幂等闸的三段式**，顺序不能换：
+
+```
+claim(key)  →  empty = 从没见过，去执行
+               有值  = 见过：要么是上次的结果（回放），要么是 @pending（结果未知）
+执行...
+complete(key, result)  → 回填结果，供下次回放
+```
+
+三种崩点各自对应不同处置：
+
+| 崩在哪 | 库里有什么 | 续跑时 |
+|---|---|---|
+| claim 之前 | 什么都没有 | 正常执行（这次副作用确实没发生过） |
+| claim 与 complete 之间 | 有键、无结果 | **不执行**，报 `DUPLICATE_SUPPRESSED` |
+| complete 之后 | 有键、有结果 | 直接回放上次的结果，**不执行** |
+
+第二行是唯一需要判断的地方。选"报错"而不是"重跑"的理由很硬：我们**不知道**那个命令
+到底跑没跑完（进程是在它执行到一半时没的）。重跑可能把一次削价变成两次；
+报错最多让模型多问一句。这类场景下，**少做一次永远优于多做一次**。
+
+代价也是明确的，写在边界那节：`@pending` 是**永久**的——如果进程崩在副作用之前，
+那一步的同一个调用会被一直拦下，而不是被重试。这是刻意选的方向。
+
+跑一次真实验收（进程真的 `halt(9)`，两个进程共用一个 MySQL）：
+
+```bash
+export APLAT_DB_URL='jdbc:mysql://127.0.0.1:3307/aplat' APLAT_DB_USER=root APLAT_DB_PASSWORD=
+./mvnw -q compile exec:java@crash -Dexec.args="u20 crash r1"
+./mvnw -q compile exec:java@crash -Dexec.args="u20 resume r1"
+./mvnw -q compile exec:java@crash -Dexec.args="u21 crash r1"
+./mvnw -q compile exec:java@crash -Dexec.args="u21 resume r1"
+```
+
+注意它**拒绝在内存 Store 下运行**：跨进程验证的前提是两个进程看到同一份状态，
+内存实现下这个演示会"成功"但什么也没证明。
 
 ### 人工确认（U12 + U13）
 
@@ -434,19 +495,15 @@ APLAT_IT_DB_URL='jdbc:mysql://127.0.0.1:3306/aplat_test' APLAT_IT_DB_USER=root \
 
 ## 6. 下一步（按依赖顺序）
 
-1. **U19/U20 耐久**：实现 `Durable`，`resume()` 用最近快照 + 其后事件重建。
-   现在 `AgentLoop` 只写 `state.snapshot` 事件、并不**消费** `Store` 的快照接口，
-   所以崩溃后**不会真的续跑**——地基（`aplat_snapshots` 表 + `latestSnapshot()`）已经在了，
-   缺的是"谁来读它、从哪一步接上"。这是 U18 之后最该做的一件。
-2. **把审计接进 Store**：审计现在是"可选落 JSON Lines 文件"，进程崩了会丢最后几条。
+1. **把审计接进 Store**：审计现在是"可选落 JSON Lines 文件"，进程崩了会丢最后几条。
    接进来之后"谁在什么时候调了什么"才真正跨重启可用。注意别直接复用 `aplat_events`（见边界那节）。
-3. **U24 MCP**：工具会在运行中动态出现，届时要让 `/tools` 的变更能推给前端（当前是启动时拉一次），
+2. **U24 MCP**：工具会在运行中动态出现，届时要让 `/tools` 的变更能推给前端（当前是启动时拉一次），
    并让 MCP 工具也能声明 `commandField`，从而自动落进策略与确认门控。
-4. **U25 RBAC + 密钥管理**：把「一个共享 key」升级成按用户/角色的授权与轮转；
+3. **U25 RBAC + 密钥管理**：把「一个共享 key」升级成按用户/角色的授权与轮转；
    HITL 的放行表也该跟着变成「按角色可放行哪些工具」。
-5. **连接池（HikariCP）**：现在每次操作开一条连接，本地够用；`JdbcStore.Connections`
+4. **连接池（HikariCP）**：现在每次操作开一条连接，本地够用；`JdbcStore.Connections`
    这个 supplier 就是为此留的缝。换池之前别急着上多实例——单实例的瓶颈先量一下再动手。
-6. **U22 调度**：定时任务若碰到需要批准的工具，要决定是「提前批准」还是「到点没人就跳过」——
+5. **U22 调度**：定时任务若碰到需要批准的工具，要决定是「提前批准」还是「到点没人就跳过」——
    这是 HITL 与调度交叉处唯一需要新设计的地方。
 
 每一项都能独立开发、独立测试、独立交付——这正是需求单元化的目的。

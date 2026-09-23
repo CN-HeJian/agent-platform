@@ -1,6 +1,9 @@
 package com.aplat.run;
 
 import com.aplat.context.BudgetContextProvider;
+import com.aplat.durable.DurableRunner;
+import com.aplat.durable.StoreCheckpointer;
+import com.aplat.durable.StoreIdempotency;
 import com.aplat.kernel.Kernel;
 import com.aplat.loop.AgentLoop;
 import com.aplat.loop.LoopBudget;
@@ -42,15 +45,19 @@ public final class Platform implements AutoCloseable {
     private final SessionLog sessionLog;
     private final Hitl hitl;
     private final Store store;
+    private final DurableRunner durable;
+    private final ToolRegistry tools;
     private final List<String> policyWarnings;
 
     private Platform(Kernel kernel, AgentLoop loop, SessionLog sessionLog, Hitl hitl, Store store,
-                     List<String> policyWarnings) {
+                     DurableRunner durable, ToolRegistry tools, List<String> policyWarnings) {
         this.kernel = kernel;
         this.loop = loop;
         this.sessionLog = sessionLog;
         this.hitl = hitl;
         this.store = store;
+        this.durable = durable;
+        this.tools = tools;
         this.policyWarnings = List.copyOf(policyWarnings);
     }
 
@@ -67,7 +74,8 @@ public final class Platform implements AutoCloseable {
      */
     public static Platform assemble(LlmAdapter llm, Sandbox sandbox, Hitl hitl, LoopBudget budget,
                                     ToolPolicy policy) {
-        return build(llm, sandbox, budget, policy, new InMemoryStore(), log -> hitl);
+        return build(llm, sandbox, budget, policy, new InMemoryStore(), log -> hitl, t -> {
+        });
     }
 
     /**
@@ -84,7 +92,8 @@ public final class Platform implements AutoCloseable {
     public static Platform assemble(LlmAdapter llm, Sandbox sandbox, LoopBudget budget,
                                     ToolPolicy policy,
                                     java.util.function.Function<SessionLog, Hitl> hitlFactory) {
-        return build(llm, sandbox, budget, policy, new InMemoryStore(), hitlFactory);
+        return build(llm, sandbox, budget, policy, new InMemoryStore(), hitlFactory, t -> {
+        });
     }
 
     /**
@@ -99,15 +108,35 @@ public final class Platform implements AutoCloseable {
     public static Platform assemble(LlmAdapter llm, Sandbox sandbox, LoopBudget budget,
                                     ToolPolicy policy, Store store,
                                     java.util.function.Function<SessionLog, Hitl> hitlFactory) {
-        return build(llm, sandbox, budget, policy, store, hitlFactory);
+        return build(llm, sandbox, budget, policy, store, hitlFactory, t -> {
+        });
+    }
+
+    /**
+     * 再带一个<b>额外工具</b>的钩子（U30 的入口）。
+     *
+     * <p>存在的理由很实在：内置工具是固定的三个（echo/add/shell），
+     * 而"要验证崩溃恢复没重复副作用"这类事需要一个能被观察的副作用工具；
+     * 第三方的插件也需要同一条口子。让它们各造一套装配，不如在这里开一个 Consumer。
+     *
+     * <p>装配期 lint 在 {@code extraTools} **之后**跑，所以外部工具漏声明
+     * {@code commandField} 一样会被喊出来——这是刻意的：插进来的工具没有豁免权。
+     */
+    public static Platform assemble(LlmAdapter llm, Sandbox sandbox, LoopBudget budget,
+                                    ToolPolicy policy, Store store,
+                                    java.util.function.Function<SessionLog, Hitl> hitlFactory,
+                                    java.util.function.Consumer<ToolRegistry> extraTools) {
+        return build(llm, sandbox, budget, policy, store, hitlFactory, extraTools);
     }
 
     private static Platform build(LlmAdapter llm, Sandbox sandbox, LoopBudget budget,
                                   ToolPolicy policy, Store store,
-                                  java.util.function.Function<SessionLog, Hitl> hitlFactory) {
+                                  java.util.function.Function<SessionLog, Hitl> hitlFactory,
+                                  java.util.function.Consumer<ToolRegistry> extraTools) {
         ToolRegistry tools = new DefaultToolRegistry();
         BuiltinTools.registerAll(tools);
         tools.register(new ShellTool(sandbox).build());
+        extraTools.accept(tools);
 
         List<String> warnings = DefaultToolPolicy.lint(tools);
 
@@ -126,6 +155,9 @@ public final class Platform implements AutoCloseable {
                 .bind(Hitl.class, hitl)
                 .build();
 
+        // 耐久（U19/U20/U21）：检查点与幂等闸都落在同一个 Store 上，所以
+        // "换存储"与"要不要耐久"是两件独立的事——前者换实现，后者由 taskId 是否为空决定。
+        StoreCheckpointer checkpointer = new StoreCheckpointer(store);
         AgentLoop loop = new AgentLoop(
                 kernel.ctx().get(LlmAdapter.class),
                 new ToolPipeline(tools, hitl, policy),
@@ -133,9 +165,13 @@ public final class Platform implements AutoCloseable {
                 kernel.ctx().get(SessionLog.class),
                 kernel.bus(),
                 budget,
-                DEFAULT_SYSTEM_PROMPT);
+                DEFAULT_SYSTEM_PROMPT,
+                checkpointer,
+                new StoreIdempotency(store));
 
-        return new Platform(kernel, loop, kernel.ctx().get(SessionLog.class), hitl, store, warnings);
+        DurableRunner durable = new DurableRunner(loop, store, checkpointer);
+        return new Platform(kernel, loop, kernel.ctx().get(SessionLog.class), hitl, store,
+                durable, tools, warnings);
     }
 
     /**
@@ -158,6 +194,21 @@ public final class Platform implements AutoCloseable {
     /** 当前装配的持久化实现（健康检查与排查用）。 */
     public Store store() {
         return store;
+    }
+
+    /**
+     * 耐久执行器（U19/U20）。
+     *
+     * <p>启动时应当先调一次 {@link DurableRunner#reclaimOrphans()}：
+     * 它把上次没跑完的任务标成 {@code CRASHED}，从而让它们可以被续跑。
+     */
+    public DurableRunner durable() {
+        return durable;
+    }
+
+    /** 已注册的工具表。给"运行中还想加个工具"的场景与测试用（U30）。 */
+    public ToolRegistry tools() {
+        return tools;
     }
 
     /** 装配期发现的安全隐患（空列表 = 干净）。启动时应当打出来。 */

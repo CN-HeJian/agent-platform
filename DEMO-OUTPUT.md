@@ -884,3 +884,141 @@ URL 里没写 `MODE=MySQL` 时构造直接抛——否则会在某次 append 上
 **连不上就启动失败。** 配了 `APLAT_DB_URL` 却连不上时**不退回内存实现**：
 悄悄降级会让服务照常起来、日志照常写，直到某次重启才发现数据全在内存里。
 这条有测试（`unreachableDatabaseFailsFast`）。
+
+---
+
+# U19/U20/U21 耐久：真实跨进程崩溃恢复
+
+单测里用 `throw new Error(...)` 模拟猝死，证明的是**逻辑**；这一节用的是
+`Runtime.halt(9)` —— 进程当场消失，不走关机钩子、不执行 finally、缓冲区不回刷，
+证明的是**机制**。两个进程、一个共享 MySQL、一个用行数数副作用的文件。
+
+（副作用为什么用文件数行数？因为进程内的计数器活不过第一次 `halt`。）
+
+## U20：崩在两步之间 → 续跑从检查点接上
+
+```
+### U20 crash ###
+=== CrashDemo u20 / crash / r3 ===
+Store   : store.jdbc[mysql] @ jdbc:mysql://127.0.0.1:3307/aplat
+Task    : t-crash-u20-r3
+已受理任务，开始执行……（进程应当在这一步里死掉，不会打印「收口」）
+[tool] 检查点已在第 1 步写下，现在让进程当场消失……
+                                        ← 到此为止，再没有输出。进程没了。
+
+### U20 resume （另一个进程）###
+--- 崩溃后库里留下的东西（另一个进程读同一份 MySQL）---
+  state  = RUNNING   （RUNNING = 执行者已经不在了）
+  step   = 0   ← 任务记录里的值。它只在认领与收口时写入，真正的进度看下面
+  checkpoint = step 1，带 4 条消息
+  事件流 = 11 条，seq 1..11   ← 崩溃进程写的那一半也在这里，序号是接着往下走的
+  sink   = 1 行
+
+认领孤儿 1 条 → CRASHED
+
+--- 续跑结果 ---
+  state  = SUCCEEDED
+  step   = 2（累计）
+  attempts = 2
+  detail = [resumed] 第二步是续跑才走完的
+  sink   = 1 → 1 行
+  结论   : ✓ 副作用总共只发生过一次 —— 已经完成的步骤没有被重放
+```
+
+三个细节值得指出：
+
+- **`state = RUNNING` 就是"孤儿"的标记。** 不是因为读了什么心跳，而是因为"我们刚刚启动"
+  ——如果它还在跑，执行者是另一个进程，而那不在我们的掌握里。这个假设的边界（单实例）
+  写在 `reclaimOrphans()` 的注释里，没有含糊过去。
+- **`step = 0` 而检查点在 `step 1`，这两者都对。** 任务记录里的 `step` 只在**认领与收口**
+  两个时机写入，进度以检查点为准。我一开始让每次 step 末尾都回写任务记录，后来改掉了：
+  那是两个真相来源，会在"检查点写成功、任务记录写失败"时悄悄分叉——于是
+  "任务说跑到第 3 步、检查点在第 2 步"，续跑接错位置且事后无从判断哪个对。
+- **`step = 2（累计）` 里的第 2 步是崩溃进程做了一半的那一步。** 它没写完检查点，
+  所以续跑重做它是正确的；被保留的是第 1 步（它的观察已在检查点里）。
+
+## U21：崩在「副作用已发生、结果未回填」之间
+
+```
+### U21 crash ###
+已受理任务，开始执行……（进程应当在这一步里死掉，不会打印「收口」）
+[tool] 副作用已落盘（.../aplat-crash-sink-u21-r2.txt），现在让进程当场消失……
+                                        ← 文件里已经有 1 行了，而结果永远没回填
+
+### U21 resume ###
+  state  = RUNNING
+  checkpoint = 无（崩在检查点之前，只能从头来）
+  sink   = 1 行
+
+--- 续跑结果 ---
+  state  = SUCCEEDED
+  detail = 好，我不重跑
+  sink   = 1 → 1 行
+  结论   : ✓ 副作用总共只发生过一次 —— 已经完成的步骤没有被重放
+
+--- 这次会话的事件统计 ---
+  tool.call = 2          ← 模型确实又发了一次同样的调用
+  tool.replayed = 1      ← 被幂等闸拦下，**没有真的执行**
+  turn.resumed = 0       ← 这次没走检查点，是从头来的（降级必须可见）
+```
+
+这一次的核心是 `tool.call = 2` 与 `tool.replayed = 1` 同时出现：
+模型**确实**又发了一次同样的调用（`ToolCall.of` 是确定性的，call id 一样），
+闸门看到键在、结果不在（`@pending`），于是拦下并回了 `DUPLICATE_SUPPRESSED`，
+模型据此改口"好，我不重跑"。副作用文件从头到尾只有 1 行。
+
+而 `turn.resumed = 0` 是刻意**没有**粉饰的地方：这次根本没有检查点可用，
+续跑是从头开始的。把它报成"恢复成功"就等于让调用方以为副作用只发生过一次。
+
+## 数据库里长这样
+
+```
+mysql> SELECT kv_key, JSON_UNQUOTE(JSON_EXTRACT(kv_value,'$.state')) AS state,
+              JSON_UNQUOTE(JSON_EXTRACT(kv_value,'$.step')) AS step,
+              JSON_UNQUOTE(JSON_EXTRACT(kv_value,'$.detail')) AS detail
+       FROM aplat_kv WHERE ns='task' AND kv_key LIKE 't-crash%';
++----------------+-----------+------+------------------------------------------+
+| kv_key         | state     | step | detail                                   |
++----------------+-----------+------+------------------------------------------+
+| t-crash-u20-r1 | SUCCEEDED | 2    | [resumed] 第二步是续跑才走完的           |
+| t-crash-u21-r1 | SUCCEEDED | 2    | 好，我不重跑                             |
++----------------+-----------+------+------------------------------------------+
+
+mysql> SELECT kv_key, CHAR_LENGTH(kv_value) AS checkpoint_json_len
+       FROM aplat_kv WHERE ns='checkpoint';        -- 存的是完整消息列表，不是步号
++----------------+----------------------+
+| t-crash-u20-r1 |                  395 |
+| t-crash-u21-r1 |                  611 |
++----------------+----------------------+
+
+mysql> SELECT idem_key, LEFT(ref,60) AS ref_head FROM aplat_idempotency
+       WHERE idem_key LIKE 'tool:t-crash%';
++-------------------------------------+------------------------------+
+| tool:t-crash-u20-r1#1#call_ca389535 | {"ok":true,"content":"sunk"} |  ← 已回填：可回放
+| tool:t-crash-u20-r1#2#call_5b273e2  | @pending                     |  ← 结果未知：不重跑
+| tool:t-crash-u21-r1#1#call_2642ea90 | @pending                     |  ← 结果未知：不重跑
++-------------------------------------+------------------------------+
+
+mysql> SELECT session_id, next_seq FROM aplat_session_seq WHERE session_id LIKE 's-crash%';
++----------------+----------+
+| s-crash-u20-r1 |       19 |     ← 两个进程写同一个会话，序号接着走
+| s-crash-u21-r1 |       21 |
++----------------+----------+
+```
+
+`#1#call_ca389535` 那行是"崩在 complete 之后"的样子（可回放）；
+另两行是"崩在 claim 与 complete 之间"的样子（`@pending` → 拦住）。
+
+## 这个机制诚实付出的一笔代价
+
+`@pending` 是**永久**的。如果进程崩在副作用**之前**（比如工具还没执行就断电），
+那一步的同一个调用会被一直拦下，而不是被重试——因为库里无法区分
+"还没执行"与"执行到一半没了"。
+
+选择这个方向是刻意的：**少做一次优于多做一次**。削价削两次的代价和"少削一次"
+的代价根本不在一个量级上。被拦住时给模型的措辞也照这个方向写：
+"it may or may not have taken effect — verify before retrying"，
+而不是让它当成普通失败去重试。
+
+它同时意味着：**同一个 task 的同一个 step 的同一个 call id，一辈子只执行一次**。
+键里带上 taskId 与 callId 正是为了让"不同任务/不同调用"互不牵连。

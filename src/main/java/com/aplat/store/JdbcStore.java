@@ -93,6 +93,20 @@ public final class JdbcStore implements Store, AutoCloseable {
               ts_millis BIGINT       NOT NULL,
               PRIMARY KEY (idem_key)
             )""";
+    /**
+     * 命名空间键值（U19 起的"其余一切"都落这张表）。
+     *
+     * <p>值用 MEDIUMTEXT 而不是 VARCHAR：任务记录里带的是完整消息历史，
+     * 而 VARCHAR 在 MySQL 里上限 65535 字节，很容易被一段长对话顶穿。
+     */
+    private static final String SQL_ENSURE_SCHEMA_KV = """
+            CREATE TABLE IF NOT EXISTS aplat_kv (
+              ns        VARCHAR(64)  NOT NULL,
+              kv_key    VARCHAR(191) NOT NULL,
+              kv_value  MEDIUMTEXT   NOT NULL,
+              ts_millis BIGINT       NOT NULL,
+              PRIMARY KEY (ns, kv_key)
+            )""";
 
     private final String url;
     private final Connections connections;
@@ -156,6 +170,7 @@ public final class JdbcStore implements Store, AutoCloseable {
             s.execute(SQL_ENSURE_SCHEMA_EVENTS);
             s.execute(SQL_ENSURE_SCHEMA_SNAPSHOTS);
             s.execute(SQL_ENSURE_SCHEMA_IDEMPOTENCY);
+            s.execute(SQL_ENSURE_SCHEMA_KV);
         } catch (SQLException e) {
             throw new IllegalStateException("建表失败（" + id() + "）：" + e.getMessage()
                     + " —— 检查 APLAT_DB_URL/USER/PASSWORD，以及目标库是否已创建", e);
@@ -286,6 +301,112 @@ public final class JdbcStore implements Store, AutoCloseable {
         }
     }
 
+    /**
+     * 回填幂等引用。
+     *
+     * <p>{@code UPDATE} 命中 0 行时**什么都不做**——刻意不 INSERT：
+     * 一个不存在的幂等键意味着"这次执行没有被声明过"，凭空创建它会伪造出一份授权。
+     */
+    @Override
+    public void putIdempotentRef(String idempotencyKey, String ref) {
+        try (Connection c = connections.open();
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE aplat_idempotency SET ref = ? WHERE idem_key = ?")) {
+            ps.setString(1, ref == null ? "" : ref);
+            ps.setString(2, idempotencyKey);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("回填幂等键失败：" + e.getMessage(), e);
+        }
+    }
+
+    // ------------------------------------------------------------ 命名空间键值
+
+    @Override
+    public void put(String namespace, String key, String json) {
+        try (Connection c = connections.open()) {
+            c.setAutoCommit(false);
+            try {
+                int updated;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE aplat_kv SET kv_value = ?, ts_millis = ? WHERE ns = ? AND kv_key = ?")) {
+                    ps.setString(1, json);
+                    ps.setLong(2, System.currentTimeMillis());
+                    ps.setString(3, namespace);
+                    ps.setString(4, key);
+                    updated = ps.executeUpdate();
+                }
+                if (updated == 0) {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "INSERT INTO aplat_kv(ns, kv_key, kv_value, ts_millis) VALUES (?, ?, ?, ?)")) {
+                        ps.setString(1, namespace);
+                        ps.setString(2, key);
+                        ps.setString(3, json);
+                        ps.setLong(4, System.currentTimeMillis());
+                        ps.executeUpdate();
+                    }
+                }
+                c.commit();
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        } catch (SQLException e) {
+            if (isDuplicateKey(e)) {
+                // 并发的第一次写撞主键：对方已经写好了，重试一次 UPDATE 即成功
+                put(namespace, key, json);
+                return;
+            }
+            throw new IllegalStateException("写 " + namespace + "/" + key + " 失败：" + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public Optional<String> get(String namespace, String key) {
+        try (Connection c = connections.open();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT kv_value FROM aplat_kv WHERE ns = ? AND kv_key = ?")) {
+            ps.setString(1, namespace);
+            ps.setString(2, key);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Optional.of(rs.getString(1)) : Optional.empty();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("读 " + namespace + "/" + key + " 失败：" + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public Map<String, String> all(String namespace) {
+        try (Connection c = connections.open();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT kv_key, kv_value FROM aplat_kv WHERE ns = ? ORDER BY kv_key")) {
+            ps.setString(1, namespace);
+            try (ResultSet rs = ps.executeQuery()) {
+                Map<String, String> out = new LinkedHashMap<>();
+                while (rs.next()) {
+                    out.put(rs.getString(1), rs.getString(2));
+                }
+                return out;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("枚举 " + namespace + " 失败：" + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public void remove(String namespace, String key) {
+        try (Connection c = connections.open();
+             PreparedStatement ps = c.prepareStatement(
+                     "DELETE FROM aplat_kv WHERE ns = ? AND kv_key = ?")) {
+            ps.setString(1, namespace);
+            ps.setString(2, key);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("删 " + namespace + "/" + key + " 失败：" + e.getMessage(), e);
+        }
+    }
+
     // ------------------------------------------------------------------ 读
 
     @Override
@@ -355,6 +476,7 @@ public final class JdbcStore implements Store, AutoCloseable {
             s.execute("DELETE FROM aplat_session_seq");
             s.execute("DELETE FROM aplat_snapshots");
             s.execute("DELETE FROM aplat_idempotency");
+            s.execute("DELETE FROM aplat_kv");
         } catch (SQLException e) {
             throw new IllegalStateException("清空失败：" + e.getMessage(), e);
         }
@@ -368,6 +490,7 @@ public final class JdbcStore implements Store, AutoCloseable {
         out.put("sessions", count("aplat_session_seq"));
         out.put("snapshots", count("aplat_snapshots"));
         out.put("idempotencyKeys", count("aplat_idempotency"));
+        out.put("kvRows", count("aplat_kv"));
         return out;
     }
 

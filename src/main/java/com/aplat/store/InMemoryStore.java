@@ -21,6 +21,8 @@ public final class InMemoryStore implements Store {
     private final Map<String, List<SessionEvent>> events = new LinkedHashMap<>();
     private final Map<String, Snapshot> snapshots = new LinkedHashMap<>();
     private final Map<String, String> idempotency = new LinkedHashMap<>();
+    /** 命名空间 → (键 → JSON)。 */
+    private final Map<String, Map<String, String>> kv = new LinkedHashMap<>();
 
     @Override
     public String id() {
@@ -67,11 +69,46 @@ public final class InMemoryStore implements Store {
         return Optional.ofNullable(idempotency.get(idempotencyKey));
     }
 
+    @Override
+    public synchronized void putIdempotentRef(String idempotencyKey, String ref) {
+        // 只覆盖已有键：不存在时**不创建**。否则一次拼错键名的写入会悄无声息地
+        // 造出一条"幂等键"，而那正是幂等判断的依据——宁可什么都不做。
+        if (idempotency.containsKey(idempotencyKey)) {
+            idempotency.put(idempotencyKey, ref == null ? "" : ref);
+        }
+    }
+
+    // ------------------------------------------------------------ 命名空间键值
+
+    @Override
+    public synchronized void put(String namespace, String key, String json) {
+        kv.computeIfAbsent(namespace, k -> new LinkedHashMap<>()).put(key, json);
+    }
+
+    @Override
+    public synchronized Optional<String> get(String namespace, String key) {
+        return Optional.ofNullable(kv.getOrDefault(namespace, Map.of()).get(key));
+    }
+
+    @Override
+    public synchronized Map<String, String> all(String namespace) {
+        return new LinkedHashMap<>(kv.getOrDefault(namespace, Map.of()));
+    }
+
+    @Override
+    public synchronized void remove(String namespace, String key) {
+        Map<String, String> ns = kv.get(namespace);
+        if (ns != null) {
+            ns.remove(key);
+        }
+    }
+
     /** 仅测试用：清空全部状态。 */
     public synchronized void clear() {
         seqs.clear();
         events.clear();
         snapshots.clear();
         idempotency.clear();
+        kv.clear();
     }
 }

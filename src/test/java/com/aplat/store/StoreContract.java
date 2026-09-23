@@ -191,6 +191,54 @@ abstract class StoreContract {
     }
 
     @Test
+    @DisplayName("幂等键可以被回填（执行后写结果）——否则「崩在副作用之后」无法识别")
+    void idempotencyRefCanBeFilledIn() {
+        assertTrue(store().markIfAbsent("k2", "in-flight"));
+        assertEquals("in-flight", store().idempotentRef("k2").orElseThrow());
+
+        // 执行完成后回填真实结果
+        store().putIdempotentRef("k2", "{\"ok\":true}");
+        assertEquals("{\"ok\":true}", store().idempotentRef("k2").orElseThrow());
+        assertFalse(store().markIfAbsent("k2", "again"), "回填不能把键变成「没人认领过」");
+
+        // 不存在的键不能被回填凭空创建——那会伪造出一份授权
+        store().putIdempotentRef("never-claimed", "x");
+        assertTrue(store().idempotentRef("never-claimed").isEmpty());
+    }
+
+    @Test
+    @DisplayName("命名空间键值：写读覆盖、按命名空间隔离、可枚举、可删")
+    void namespacedKeyValue() {
+        store().put("task", "t1", "{\"state\":\"RUNNING\"}");
+        store().put("task", "t2", "{\"state\":\"PENDING\"}");
+        store().put("schedule", "t1", "{\"cron\":\"* * * * *\"}");
+
+        assertEquals("{\"state\":\"RUNNING\"}", store().get("task", "t1").orElseThrow());
+        assertEquals(2, store().all("task").size(), "命名空间之间必须隔离");
+        assertEquals(1, store().all("schedule").size());
+        assertTrue(store().all("nope").isEmpty());
+
+        // 同键覆盖
+        store().put("task", "t1", "{\"state\":\"SUCCEEDED\"}");
+        assertEquals("{\"state\":\"SUCCEEDED\"}", store().get("task", "t1").orElseThrow());
+        assertEquals(2, store().all("task").size(), "覆盖不该多出一行");
+
+        store().remove("task", "t1");
+        assertTrue(store().get("task", "t1").isEmpty());
+        assertEquals(1, store().all("task").size());
+        store().remove("task", "t1"); // 幂等
+    }
+
+    @Test
+    @DisplayName("命名空间键值能吃下大值（任务记录里带的是完整消息历史）")
+    void keyValueHandlesLargeValues() {
+        String big = "x".repeat(200_000);
+        store().put("task", "big", big);
+        assertEquals(200_000, store().get("task", "big").orElseThrow().length());
+        assertTrue(store().get("task", "big").orElseThrow().equals(big));
+    }
+
+    @Test
     @DisplayName("并发首写同一个新会话：也不会撞号（这是取号实现最容易翻车的地方）")
     void concurrentFirstAppendOfNewSession() throws Exception {
         final int threads = 8;

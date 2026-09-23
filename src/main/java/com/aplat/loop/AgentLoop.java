@@ -1,5 +1,7 @@
 package com.aplat.loop;
 
+import com.aplat.durable.Checkpointer;
+import com.aplat.durable.IdempotencyGuard;
 import com.aplat.kernel.EventBus;
 import com.aplat.seam.ContextProvider;
 import com.aplat.seam.LlmAdapter;
@@ -17,6 +19,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Agent 循环：一个 turn = 若干 step，每个 step 是一次"思考→行动→观察"。
@@ -29,6 +32,21 @@ import java.util.Map;
  *   <li>任何一步失败都不炸循环，而是转成观察回填，让模型自己换路；</li>
  *   <li>终止条件只有三个：模型收口、步数用尽、硬错误——绝不无限重试。</li>
  * </ol>
+ *
+ * <h2>耐久（U20/U21）是怎么接进来的</h2>
+ *
+ * <p>循环本身仍然"无状态"：它只在每个 step 末尾调一次
+ * {@link Checkpointer#checkpoint}，以及在执行工具前问一次 {@link IdempotencyGuard}。
+ * 两者都有 noop 实现，所以不需要恢复的场景（同步调用、单测）行为一字未变。
+ *
+ * <p><b>为什么检查点存的是完整消息列表而不是步号</b>：续跑时模型要和崩溃前看到一模一样的
+ * 上下文（包括工具返回的观察）。只存步号等于让模型失忆重来——那还不如不恢复。
+ *
+ * <p><b>为什么要在执行工具前"声明"</b>：进程可能崩在"命令跑了"与"检查点写了"之间。
+ * 声明 + 回填结果让续跑能分辨三种情形（见 {@link IdempotencyGuard}），
+ * 从而做到"副作用至多一次"，而不是"尽量少重复"。
+ *
+ * <p>{@code taskId} 为 null 时，检查点与幂等都不启用——这条路径与加耐久之前完全一致。
  */
 public final class AgentLoop {
 
@@ -39,6 +57,8 @@ public final class AgentLoop {
     private final EventBus bus;
     private final LoopBudget budget;
     private final String systemPrompt;
+    private final Checkpointer checkpointer;
+    private final IdempotencyGuard idempotency;
 
     public AgentLoop(LlmAdapter llm,
                      ToolPipeline pipeline,
@@ -47,6 +67,19 @@ public final class AgentLoop {
                      EventBus bus,
                      LoopBudget budget,
                      String systemPrompt) {
+        this(llm, pipeline, context, log, bus, budget, systemPrompt,
+                Checkpointer.noop(), IdempotencyGuard.none());
+    }
+
+    public AgentLoop(LlmAdapter llm,
+                     ToolPipeline pipeline,
+                     ContextProvider context,
+                     SessionLog log,
+                     EventBus bus,
+                     LoopBudget budget,
+                     String systemPrompt,
+                     Checkpointer checkpointer,
+                     IdempotencyGuard idempotency) {
         this.llm = llm;
         this.pipeline = pipeline;
         this.context = context;
@@ -54,6 +87,16 @@ public final class AgentLoop {
         this.bus = bus;
         this.budget = budget;
         this.systemPrompt = systemPrompt;
+        this.checkpointer = checkpointer;
+        this.idempotency = idempotency;
+    }
+
+    public SessionLog sessionLog() {
+        return log;
+    }
+
+    public LoopBudget budget() {
+        return budget;
     }
 
     public TurnResult run(String sessionId, String userInput) {
@@ -72,6 +115,15 @@ public final class AgentLoop {
      * @param history 之前的 user/assistant 轮次；不含本轮输入，也不含 system
      */
     public TurnResult run(String sessionId, List<LlmMessage> history, String userInput) {
+        return run(sessionId, history, userInput, null);
+    }
+
+    /**
+     * 带 <b>taskId</b> 的 run：启用检查点与幂等。
+     *
+     * @param taskId null = 不启用耐久（行为与之前完全一致）
+     */
+    public TurnResult run(String sessionId, List<LlmMessage> history, String userInput, String taskId) {
         List<LlmMessage> messages = new ArrayList<>();
         messages.add(LlmMessage.system(systemPrompt));
         messages.addAll(history);
@@ -80,12 +132,45 @@ public final class AgentLoop {
         log.append(sessionId, SessionLog.EV_INPUT,
                 Map.of("text", userInput, "historyTurns", history.size()));
         log.append(sessionId, SessionLog.EV_TURN_START, Map.of("input", userInput));
+        return drive(sessionId, taskId, messages, 1, null);
+    }
 
+    /**
+     * 从检查点续跑（U20）。
+     *
+     * <p>严格从 {@code checkpoint.step() + 1} 开始：已经跑完的步骤**不重跑**，
+     * 因为它们的观察已经在检查点的消息里了。这正是"断点续跑"与"重试"的区别。
+     *
+     * <p>若检查点已经用完了预算（{@code step >= maxSteps}），这里会直接以
+     * {@code MAX_STEPS} 收口而不是空转——并且事件里写明原因是"续跑时预算已尽"，
+     * 免得看起来像循环坏了。
+     */
+    public TurnResult resume(String sessionId, Checkpointer.Checkpoint checkpoint, String taskId) {
+        List<LlmMessage> messages = new ArrayList<>(checkpoint.messages());
+        int firstStep = checkpoint.step() + 1;
+        log.append(sessionId, SessionLog.EV_TURN_RESUMED,
+                Map.of("fromStep", firstStep, "restoredMessages", messages.size(),
+                        "taskId", taskId == null ? "" : taskId));
+
+        if (firstStep > budget.maxSteps()) {
+            log.append(sessionId, SessionLog.EV_TURN_CLOSED,
+                    Map.of("step", checkpoint.step(), "reason", "budget_exhausted_on_resume",
+                            "limit", budget.maxSteps()));
+            return new TurnResult(sessionId, TurnResult.Status.MAX_STEPS, null,
+                    checkpoint.step(), log.events(sessionId));
+        }
+        return drive(sessionId, taskId, messages, firstStep, checkpoint);
+    }
+
+    // ---------------------------------------------------------------- 主体
+
+    private TurnResult drive(String sessionId, String taskId, List<LlmMessage> messages,
+                             int firstStep, Checkpointer.Checkpoint resumedFrom) {
         String finalText = null;
         TurnResult.Status status = TurnResult.Status.MAX_STEPS;
-        int stepsUsed = 0;
+        int stepsUsed = resumedFrom == null ? 0 : resumedFrom.step();
 
-        for (int step = 1; step <= budget.maxSteps(); step++) {
+        for (int step = firstStep; step <= budget.maxSteps(); step++) {
             // 循环变量不能进 lambda，这里取一份有效最终变量给流式回调用
             final int stepNo = step;
             stepsUsed = stepNo;
@@ -147,7 +232,7 @@ public final class AgentLoop {
                         "tool", String.valueOf(call.name()),
                         "args", String.valueOf(call.argumentsJson())));
 
-                ToolResult result = pipeline.execute(sessionId, call);
+                ToolResult result = executeGuarded(sessionId, taskId, step, call);
 
                 Map<String, Object> resPayload = new LinkedHashMap<>();
                 resPayload.put("step", step);
@@ -168,6 +253,11 @@ public final class AgentLoop {
             // 5) 状态快照：便于崩溃后从最近一步续跑
             log.append(sessionId, SessionLog.EV_STATE_SNAPSHOT, Map.of(
                     "step", step, "messages", messages.size(), "state", Json.write(Map.of("step", step))));
+
+            // 6) 检查点（U20）：存**完整消息**，续跑时模型看到的上下文与此刻一致
+            if (taskId != null) {
+                checkpointer.checkpoint(taskId, step, messages);
+            }
         }
 
         if (status == TurnResult.Status.MAX_STEPS && finalText == null) {
@@ -179,6 +269,33 @@ public final class AgentLoop {
         List<SessionEvent> events = log.events(sessionId);
         bus.publish(new TurnFinished(sessionId, status, stepsUsed));
         return new TurnResult(sessionId, status, finalText, stepsUsed, events);
+    }
+
+    /**
+     * 执行一次工具调用，带幂等闸（U21）。
+     *
+     * <p>没开耐久（{@code taskId == null}）时直接执行，一行附加行为都没有。
+     */
+    private ToolResult executeGuarded(String sessionId, String taskId, int step, ToolCall call) {
+        if (taskId == null) {
+            return pipeline.execute(sessionId, call);
+        }
+        // 键里必须带 step 与 callId：同一步里的多次不同调用、不同步里的同名调用，都是不同的副作用
+        String key = taskId + "#" + step + "#" + call.id();
+        Optional<ToolResult> already = idempotency.claim(key);
+        if (already.isPresent()) {
+            // 回放：**没有真的执行**。这条事件让"这一步省了一次副作用"变得可见——
+            // 否则从事件流看，和真跑了一遍完全一样。
+            log.append(sessionId, SessionLog.EV_TOOL_REPLAYED, Map.of(
+                    "step", step, "id", String.valueOf(call.id()),
+                    "tool", String.valueOf(call.name()),
+                    "reason", IdempotencyGuard.ERR_DUPLICATE_SUPPRESSED.equals(already.get().errorCode())
+                            ? "result-unknown" : "replayed-previous-result"));
+            return already.get();
+        }
+        ToolResult result = pipeline.execute(sessionId, call);
+        idempotency.complete(key, result);
+        return result;
     }
 
     /** 供观测模块订阅的完成通知。 */

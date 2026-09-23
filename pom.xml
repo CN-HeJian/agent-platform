@@ -88,6 +88,13 @@
               <mainClass>com.aplat.run.Serve</mainClass>
             </configuration>
           </execution>
+          <!-- `exec:java@crash -Dexec.args="u20 crash r1"`：真的 halt 掉进程，验证跨进程续跑 -->
+          <execution>
+            <id>crash</id>
+            <configuration>
+              <mainClass>com.aplat.run.CrashDemo</mainClass>
+            </configuration>
+          </execution>
         </executions>
       </plugin>
     </plugins>
