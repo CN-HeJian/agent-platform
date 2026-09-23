@@ -361,3 +361,20 @@ button.ghost:hover {
 .tl-error .tl-type {
   color: var(--err);
 }
+
+/* U16：右上角的 API Key 输入。做得窄一点，免得挤掉其它入口 */
+.key-input {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 8px;
+  width: 200px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--ink);
+}
+
+.key-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}

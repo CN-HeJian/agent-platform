@@ -2,16 +2,17 @@ package com.aplat.web;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.HexFormat;
 import java.util.Optional;
+import java.util.function.Function;
 
 /**
- * 最小 API Key 守卫。
+ * API Key 守卫（U16）。
  *
- * <p><b>定位</b>：这是 U16（鉴权）的<b>前置安全网</b>，不是 U16 本身。它只做一件事——
- * "配了 key 就必须带对，否则 401"。RBAC、按角色授权、密钥轮转、审计与限流都在 U16/U17/U25。
+ * <p><b>做到哪一步</b>：只做"配了 key 就必须带对，否则 401"。RBAC、按角色授权、密钥轮转属 U25。
  *
- * <p>为什么要现在就有：这个服务能执行 shell。默认只听 127.0.0.1，但只要有人把它暴露出去，
- * 没有这道闸就是"任意命令执行即服务"。所以宁可提前放一个 30 行的闸，也不要留一个裸奔窗口。
+ * <p>为什么要现在就有一个：这个服务能执行 shell。默认只听 127.0.0.1，但只要有人把它暴露出去，
+ * 没有这道闸就是"任意命令执行即服务"。
  *
  * <p>支持的携带方式（任选其一）：
  * <pre>
@@ -19,12 +20,19 @@ import java.util.Optional;
  *   Authorization: Bearer &lt;key&gt;
  *   ?apiKey=&lt;key&gt;        （只给 EventSource 用——它不能自定义请求头）
  * </pre>
+ *
+ * <p><b>身份用指纹，不用原值</b>：校验通过后对外只暴露 {@link #fingerprint(String)}
+ * ——SHA-256 的前 8 位十六进制。审计与限流拿它做标识，于是日志里**永远不会出现密钥原文**。
+ * 这条有测试钉着。
  */
 public final class ApiKeyGuard {
 
     private static final String HEADER_API_KEY = "X-API-Key";
     private static final String HEADER_AUTH = "Authorization";
     private static final String BEARER = "Bearer ";
+
+    /** 未启用鉴权时的身份标识（限流仍要按调用方隔离，所以不能是 null）。 */
+    public static final String ANONYMOUS = "anonymous";
 
     private final String expected;
 
@@ -36,19 +44,27 @@ public final class ApiKeyGuard {
         return expected != null;
     }
 
+    public boolean allowed(Function<String, String> headerLookup, String queryApiKey) {
+        return identify(headerLookup, queryApiKey).isPresent();
+    }
+
     /**
+     * 校验并给出**调用方身份**（密钥指纹，或 {@link #ANONYMOUS}）。
+     *
      * @param headerLookup 大小写不敏感的取头函数
      * @param queryApiKey  查询串里的 apiKey（EventSource 无法带头，必须留这条路）
+     * @return empty = 未通过校验
      */
-    public boolean allowed(java.util.function.Function<String, String> headerLookup, String queryApiKey) {
+    public Optional<String> identify(Function<String, String> headerLookup, String queryApiKey) {
         if (!enabled()) {
-            return true; // 未配置 = 不鉴权（仅本机自查场景）
+            return Optional.of(ANONYMOUS);
         }
-        Optional<String> presented = firstNonBlank(
+        return firstNonBlank(
                 headerLookup.apply(HEADER_API_KEY),
                 bearerOf(headerLookup.apply(HEADER_AUTH)),
-                queryApiKey);
-        return presented.map(this::matches).orElse(false);
+                queryApiKey)
+                .filter(this::matches)
+                .map(ApiKeyGuard::fingerprint);
     }
 
     /** 常量时间比较，避免把 key 逐字符比出时间差。 */
@@ -56,6 +72,21 @@ public final class ApiKeyGuard {
         return MessageDigest.isEqual(
                 presented.getBytes(StandardCharsets.UTF_8),
                 expected.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** 密钥指纹：SHA-256 前 8 位十六进制。够区分调用方，又不可反推。 */
+    public static String fingerprint(String key) {
+        if (key == null) {
+            return ANONYMOUS;
+        }
+        try {
+            byte[] hash = MessageDigest.getInstance("SHA-256")
+                    .digest(key.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(hash, 0, 4);
+        } catch (Exception e) {
+            // 理论上不会发生（JDK 必带 SHA-256）；真发生了也不能让请求挂掉
+            return "unavailable";
+        }
     }
 
     private static String bearerOf(String authorizationHeader) {

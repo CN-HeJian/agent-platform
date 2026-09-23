@@ -25,7 +25,8 @@
 | **HTTP + SSE 传输层（U02）** | `web/` | ✅ 零新增依赖（JDK HttpServer + 虚拟线程） |
 | **AG-UI 规范端点（U08）** | `session/AgUiProjector` + `POST /agui/run` | ✅ 事件形状符合规范，客户端可直连 |
 | **断线续传（U09）** | `web/EventPump` | ✅ 机制已验（无缺无重） |
-| **API Key 守卫（U16 前置）** | `web/ApiKeyGuard` | ✅ 最小闸，完整鉴权仍属 U16 |
+| **API Key 鉴权（U16）** | `web/ApiKeyGuard` | ✅ 三种携带方式；前端三条路都带 key |
+| **审计 + 限流（U17）** | `web/AuditLog` · `web/RateLimiter` | ✅ 谁/何时/调什么可追溯；按调用方令牌桶限流 |
 | **工具策略（U15）** | `tools/ToolPolicy` + `ToolSpec.executing` | ✅ 工具级权限 + 危险命令，**不靠工具名** |
 | **前端聊天面（U07a）** | `ui/`（Vite + React + CopilotKit） | ✅ 直连 `/agui/run`，已用真浏览器验过 |
 | **工具卡片 + 过程时间线（U07b）** | `ui/src/ToolCard.tsx` · `ui/src/Timeline.tsx` | ✅ 工具参数/结果可视化；原始事件实时可见 |
@@ -67,6 +68,7 @@ cd ui && npm install && npm run build && cd ..
 | `GET` | `/health` | 健康 + 装配自检（免鉴权，供探针） |
 | `GET` | `/kernel` | 装配清单与可替换能力缝（排查第一站） |
 | `GET` | `/tools` | 工具清单（名字/说明/是否需批准/是否执行命令）——**前端靠它渲染工具卡片，不硬编码工具名** |
+| `GET` | `/audit?limit=N` | 审计：谁 / 何时 / 调了什么 / 结果（受鉴权保护——审计记录本身也是敏感信息） |
 | `POST` | `/run` | `{"sessionId?","input"}` → 跑完一个 turn，返回 JSON |
 | `GET` | `/agui/stream?input=&sessionId=` | 简化流：跑一个 turn 并 SSE 吐**本平台信封**事件（自带控制台用） |
 | `GET` | `/agui/events/{sessionId}?lastEventId=` | 纯事件面：回填 + 实时，**断线续传**；加 `&raw=1` 则帧不带 `event:` 字段 |
@@ -99,6 +101,34 @@ curl -N 'http://127.0.0.1:8787/agui/events/s-abc?lastEventId=7&once=turn.closed'
 **事件流与 turn 执行是两条独立入口**——`/agui/stream` 只是"订阅 + 触发一次 turn"的组合，
 `/agui/events` 完全不碰循环。所以断线重连、多端同看、事后补看走的是同一条路，后端不需要做特例。
 
+### 鉴权 / 审计 / 限流（U16 + U17）
+
+```bash
+export APLAT_API_KEY=dev-secret            # 不设 = 不鉴权（本机自查）
+export APLAT_RATE_LIMIT_PER_MIN=30         # 0 = 不限
+export APLAT_AUDIT_FILE=logs/audit.jsonl   # 不设则只留内存
+./mvnw -q compile exec:java@serve
+```
+
+**免鉴权 / 免限流的只有**：`/health`、`/`、`/ui/*`、`/favicon.ico`。
+**API 面（`/run`、`/agui/run`、`/agui/events`、`/tools`、`/audit`…）一律要 key 且计入限流**——
+静态资源本身不含敏感信息，探针不该需要凭据；而真正产生副作用与泄露信息的是 API 面。
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8787/run \
+     -H 'Content-Type: application/json' -d '{"input":"hi"}'                 # → 401
+curl -s -X POST http://127.0.0.1:8787/run -H 'X-API-Key: dev-secret' \
+     -H 'Content-Type: application/json' -d '{"input":"hi"}'                 # → 200
+curl -s -H 'X-API-Key: dev-secret' 'http://127.0.0.1:8787/audit?limit=5'     # 审计
+```
+
+**审计身份用密钥指纹，不用原值**（SHA-256 前 8 位）。审计日志是"给很多人看"的东西，
+往里写密钥原文等于把密钥抄送一遍——有一条测试专门钉这件事。
+
+**限流是令牌桶**（不是固定窗口：那个在窗口边界会放行两倍流量），按调用方隔离。
+未启用鉴权时按 **IP** 隔离，否则所有人共用一个 `anonymous` 桶、一个人刷满就把别人全挡住。
+超限返回 `429` + `Retry-After`。
+
 ### 前端（U07a）
 
 ```bash
@@ -127,8 +157,16 @@ const agents = { default: new HttpAgent({ url: `${location.origin}/agui/run` }) 
 >    （CopilotKit 的 UI 带着 mermaid / cytoscape / 代码高亮）。本地自查无所谓，
 >    真要对外就得配 code-splitting 或换更轻的自研面。
 >
-> 另外如果你把 `APLAT_API_KEY` 打开了，前端**目前还不能自动带上**——
-> 静态资源免鉴权，但 `/agui/run` 会 401。要么先关掉 key，要么在 provider 里补 headers（属 U16 收尾）。
+**开了鉴权之后**，右上角有个 API Key 输入框（存 `localStorage`）。注意 key 要带在**三条路**上，
+漏掉任何一条那个功能区就静默失效：
+
+| 路径 | 怎么带 |
+|---|---|
+| 聊天 → `POST /agui/run` | `HttpAgent` 的 `headers` |
+| 时间线 → `GET /agui/events` | 查询参数 `?apiKey=`（`EventSource` **不能**自定义请求头） |
+| 工具卡片 → `GET /tools` | `fetch` 的请求头 |
+
+没填 key 时页脚会明确写"工具清单未加载：需要 API Key（右上角填）"，而不是给你一个空列表。
 
 #### 工具卡片与过程时间线（U07b）
 
@@ -155,6 +193,8 @@ const agents = { default: new HttpAgent({ url: `${location.origin}/agui/run` }) 
 | `APLAT_API_KEY` | 空 | 设了就强制校验；`/health` 豁免 |
 | `APLAT_SSE_HEARTBEAT_MS` | `15000` | SSE 心跳，防中间层掐连接；**同时决定断连检测延迟**（最多滞后 2 个周期） |
 | `APLAT_CORS_ANY_ORIGIN` | `true` | 开发态方便前端；生产应收紧 |
+| `APLAT_RATE_LIMIT_PER_MIN` | `120` | 按调用方隔离的每分钟请求上限；`0` = 不限 |
+| `APLAT_AUDIT_FILE` | 空 | 设了就落盘为 JSON Lines；不设只留内存（重启即丢） |
 
 ### 在 IntelliJ IDEA 里
 
@@ -190,8 +230,8 @@ run/Demo            ← 离线段到端演示
   ├─ context/       BudgetContextProvider（三层压缩 + 双记录）
   ├─ llm/           OpenAiCompatibleAdapter（流式 SSE）/ ScriptedLlmAdapter（测试）
   ├─ session/       EventSourcedSessionLog / AgUiMapper（信封）/ AgUiProjector（AG-UI 规范）
-  ├─ web/           HttpTransport / SseWriter / EventPump / ApiKeyGuard / ServerConfig
-  │                 UiAssets（托管 ui/dist：路径穿越防护 + SPA 回退）
+  ├─ web/           HttpTransport / SseWriter / EventPump / ServerConfig / UiAssets
+  │                 ApiKeyGuard（U16）/ RequestScope · AuditLog（U17）/ RateLimiter（U17）
   └─ store/         InMemoryStore（Store 契约的参照实现）
 ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产物由 /ui/ 托管
   ├─ src/App.tsx        聊天面装配：直连 HttpAgent + 工具卡片渲染器 + 时间线
@@ -231,6 +271,9 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
 | `ToolPolicyTest` | **U15 验收**：不靠名字拦截 · 声明哪个字段就查哪个 · 越权工具被拒 · 漏声明被 lint |
 | `AgUiProjectorTest` | **U08 验收**：AG-UI 规范字段 · step 生命周期配平 · 内部事件不外泄 |
 | `AgUiRunEndpointTest` | **U07a 验收**：`POST /agui/run` 事件序列 · 多轮历史喂给循环 · content 分片 |
+| `RateLimiterTest` | **U17**：额度用满即拒 · 按时间连续补充 · 不超补 · `Retry-After` 向上取整 · 按调用方隔离 |
+| `AuditLogTest` | **U17**：可追溯 · 内存有界 · 落盘 JSONL · **close 不丢记录** · **绝不记密钥原文** |
+| `AuthAuditRateLimitTest` | **U16/U17 验收**：401 / 免鉴权白名单 / 429+Retry-After / 审计指纹 / 流式请求记成 200 |
 
 `StoreContractTest` 的用法是有意的：写 MySQL 实现时不要另写一套测试，让它跟内存实现
 跑同一组断言。这才是"可替换"的证明方式。
@@ -254,7 +297,14 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
   第二次才 EPIPE。默认 15s 心跳意味着订阅最多滞留约 30s 才回收——要更快就调小该值。
 - **SSE 没有背压**：慢客户端会拖住它自己那条虚拟线程（不会拖垮别人，但也不会自动丢帧）。
   单机自查够用；对外服务前需要加"落后太多就断开"的策略。
-- **`ApiKeyGuard` 是安全网不是鉴权体系**：没有 RBAC、没有轮转、没有审计。完整版是 U16/U17/U25。
+- **`ApiKeyGuard` 还不是鉴权体系**：只有"一个共享 key 对不对"，**没有 RBAC、没有密钥轮转、没有按用户授权**。
+  身份只是密钥指纹——够审计溯源，不够做权限分级。完整版是 U25。
+- **审计默认只留内存**：设了 `APLAT_AUDIT_FILE` 才落盘，且是本地文件（可删改）。
+  真要做到"不可否认"，得进 WORM 存储或远端日志——方向在这里，但不在本项目范围内。
+- **限流是单实例的**：每个进程各限各的。多实例部署时需要共享计数（Redis 之类）。
+- **限流不区分接口权重**：一条 SSE 长连接和一次 `/health` 同样算一个令牌。
+- **审计里的 IP 在反向代理后面是代理地址**：要还原真实来源得解析 `X-Forwarded-For`，
+  而那需要先确定信任边界——现在刻意没做，免得给出一个看着对其实可伪造的值。
 - **前端直连只适合本地**：`agents__unsafe_dev_only` 是官方给开发用的口子，生产要走
   `selfManagedAgents`（付费档）或架 runtime 代理。详见「前端（U07a）」一节的警告。
 - **前端还不能自动带 API Key**：开了 `APLAT_API_KEY` 后 `/ui/` 静态资源仍可访问，
@@ -270,13 +320,13 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
 
 ## 6. 下一步（按依赖顺序）
 
-1. **U16 收尾**：让前端能带 API Key（provider headers），把 `/agui/run` 的鉴权打通；
-   顺带补审计与限流（U17）。现在 `/ui/` 的时间线会对任何能访问端口的人暴露内部信息，
-   所以这件事比"再多做点前端"更该先做。
-2. **U12/U13 HITL 四条路径**：`HitlDecision.Always` 目前按 `Once` 处理，需要会话级放行表；
-   传输层与前端都已能承载（确认交互落在 AG-UI 的审批事件上）。
-3. **U18 MySQL Store**：实现 `Store`，继承 `StoreContractTest`。
-4. **U19/U20 耐久**：实现 `Durable`，`resume()` 用最近快照 + 其后事件重建。
-5. **U24 MCP**：工具会在运行中动态出现，届时要让 `/tools` 的变更能推给前端（当前是启动时拉一次）。
+1. **U12/U13 HITL 四条路径**：`HitlDecision.Always` 目前按 `Once` 处理，需要会话级放行表；
+   这是**功能上的最大缺口**（现在"工具需批准"实际等于"总是批准"）。
+   传输层、AG-UI 契约、前端卡片都已能承载。
+2. **U18 MySQL Store**：实现 `Store`，继承 `StoreContractTest`；顺带把审计也接进去，
+   这样审计才真正重启不丢。
+3. **U19/U20 耐久**：实现 `Durable`，`resume()` 用最近快照 + 其后事件重建。
+4. **U24 MCP**：工具会在运行中动态出现，届时要让 `/tools` 的变更能推给前端（当前是启动时拉一次）。
+5. **U25 RBAC + 密钥管理**：把"一个共享 key"升级成按用户/角色的授权与轮转。
 
 每一项都能独立开发、独立测试、独立交付——这正是需求单元化的目的。

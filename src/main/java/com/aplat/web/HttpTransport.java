@@ -65,6 +65,8 @@ public final class HttpTransport implements AutoCloseable {
     private final ServerConfig config;
     private final ApiKeyGuard guard;
     private final UiAssets uiAssets;
+    private final RateLimiter rateLimiter;
+    private final AuditLog auditLog;
     private final HttpServer server;
     private final ScheduledExecutorService heartbeat;
     private final Set<SseWriter> activeStreams = ConcurrentHashMap.newKeySet();
@@ -79,6 +81,10 @@ public final class HttpTransport implements AutoCloseable {
         this.config = config;
         this.guard = new ApiKeyGuard(config.apiKey());
         this.uiAssets = uiAssets;
+        this.rateLimiter = new RateLimiter(config.rateLimitPerMin());
+        this.auditLog = config.auditFile() == null
+                ? AuditLog.inMemory()
+                : AuditLog.toFile(java.nio.file.Path.of(config.auditFile()));
         this.server = HttpServer.create(new InetSocketAddress(config.host(), config.port()), 0);
         // 每个请求一条虚拟线程：SSE 处理要长时间阻塞在等事件上，平台线程池会被瞬间占满
         this.server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
@@ -95,6 +101,7 @@ public final class HttpTransport implements AutoCloseable {
         return path.equals("/health")
                 || path.equals("/")
                 || path.equals("/index.html")
+                || path.equals("/favicon.ico")
                 || path.equals("/ui")
                 || path.startsWith(UiAssets.URL_PREFIX);
     }
@@ -124,6 +131,11 @@ public final class HttpTransport implements AutoCloseable {
         return uiAssets.hintIfMissing();
     }
 
+    /** 审计日志（包内可见：测试要直接断言记录内容，避免为了读它再多花一个限流令牌）。 */
+    AuditLog auditLog() {
+        return auditLog;
+    }
+
     @Override
     public void close() {
         for (SseWriter w : activeStreams) {
@@ -132,6 +144,7 @@ public final class HttpTransport implements AutoCloseable {
         activeStreams.clear();
         heartbeat.shutdownNow();
         server.stop(0);
+        auditLog.close();
     }
 
     // ---------------------------------------------------------------- routing
@@ -141,29 +154,39 @@ public final class HttpTransport implements AutoCloseable {
         // try-with-resources 会在异常抛出时先把资源关掉，再进 catch —— 那时 exchange 已关闭，
         // 任何补救应答都会以 "stream is closed" 失败，客户端只能看到"连接被重置"。
         // 正确顺序是：catch 里先回应答，finally 再关。
+        // 请求现场：身份、对端、最终状态码——审计要用（见 RequestScope 的注释）
+        String method = ex.getRequestMethod().toUpperCase();
+        String path = ex.getRequestURI().getPath();
+        String clientIp = clientIpOf(ex);
+        java.util.Optional<String> identified =
+                guard.identify(ex.getRequestHeaders()::getFirst, query(ex).get("apiKey"));
+        RequestScope scope = RequestScope.begin(identified.orElse("(rejected)"), clientIp, method, path);
+        long startedAt = System.nanoTime();
+
         try {
             applyCommonHeaders(ex);
             if ("OPTIONS".equalsIgnoreCase(ex.getRequestMethod())) {
                 ex.sendResponseHeaders(204, -1);
+                RequestScope.current().ifPresent(sc -> sc.responded(204));
                 return;
             }
 
-            String path = ex.getRequestURI().getPath();
-            String method = ex.getRequestMethod().toUpperCase();
+            // 静态资源与探针免鉴权、也免限流：它们本身不含敏感信息，也不产生副作用。
+            // 真正的保护在 API 面（需要带 key 且计入限流）。
+            boolean publicPath = isPublic(path) && method.equals("GET");
+            if (publicPath) {
+                scope.note(RequestScope.NOTE_PUBLIC);
+            } else if (identified.isEmpty()) {
+                scope.note("unauthorized");
+                sendError(ex, 401, "UNAUTHORIZED", "missing or invalid API key");
+                return;
+            } else if (!allowRate(ex, scope, identified.get(), clientIp)) {
+                return;
+            }
 
             if (path.equals("/health") && method.equals("GET")) {
                 sendJson(ex, 200, health());
-                return;
-            }
-            if (isPublic(path) && method.equals("GET")) {
-                // 静态资源与探针免鉴权：它们本身不含敏感信息，
-                // 真正的保护在 API 面（需要带 key 的调用）。
-            } else if (!guard.allowed(ex.getRequestHeaders()::getFirst, query(ex).get("apiKey"))) {
-                sendError(ex, 401, "UNAUTHORIZED", "missing or invalid API key");
-                return;
-            }
-
-            if ((path.equals("/") || path.equals("/index.html")) && method.equals("GET")) {
+            } else if ((path.equals("/") || path.equals("/index.html")) && method.equals("GET")) {
                 sendConsole(ex);
             } else if ((path.equals("/ui") || path.startsWith(UiAssets.URL_PREFIX)) && method.equals("GET")) {
                 sendUiAsset(ex, path);
@@ -171,6 +194,8 @@ public final class HttpTransport implements AutoCloseable {
                 sendJson(ex, 200, kernelReport());
             } else if (path.equals("/tools") && method.equals("GET")) {
                 sendJson(ex, 200, toolsReport());
+            } else if (path.equals("/audit") && method.equals("GET")) {
+                sendJson(ex, 200, auditReport(query(ex)));
             } else if (path.equals("/run") && method.equals("POST")) {
                 handleRun(ex);
             } else if (path.equals("/agui/run") && method.equals("POST")) {
@@ -197,7 +222,53 @@ public final class HttpTransport implements AutoCloseable {
                 log("could not send 500: " + nested);
             }
         } finally {
+            recordAudit(scope, startedAt);
+            RequestScope.end();
             ex.close();
+        }
+    }
+
+    /** 记一条审计。绝不抛异常、绝不阻塞（见 AuditLog 的设计约束）。 */
+    private void recordAudit(RequestScope scope, long startedAtNanos) {
+        try {
+            long ms = (System.nanoTime() - startedAtNanos) / 1_000_000L;
+            auditLog.record(new RequestAudit(
+                    java.time.Instant.now(), scope.identity, scope.clientIp,
+                    scope.method, scope.path, scope.status(), ms, scope.note()));
+        } catch (Exception e) {
+            log("audit failed: " + e);
+        }
+    }
+
+    /**
+     * 限流闸。
+     *
+     * <p>未启用鉴权时按 **IP** 隔离，否则所有人共用一个 {@code anonymous} 桶——
+     * 一个人刷满就把别人全挡住了。
+     */
+    private boolean allowRate(HttpExchange ex, RequestScope scope, String identity, String clientIp)
+            throws IOException {
+        if (!config.rateLimitEnabled()) {
+            return true;
+        }
+        String key = guard.enabled() ? identity : clientIp;
+        if (rateLimiter.tryAcquire(key)) {
+            return true;
+        }
+        long retry = Math.max(1, rateLimiter.retryAfterSeconds(key));
+        scope.note("rate_limited");
+        ex.getResponseHeaders().set("Retry-After", String.valueOf(retry));
+        sendError(ex, 429, "RATE_LIMITED",
+                "too many requests (limit " + config.rateLimitPerMin() + "/min); retry after " + retry + "s");
+        return false;
+    }
+
+    private static String clientIpOf(HttpExchange ex) {
+        try {
+            var addr = ex.getRemoteAddress();
+            return addr == null ? "-" : addr.getAddress().getHostAddress();
+        } catch (Exception e) {
+            return "-";
         }
     }
 
@@ -447,6 +518,10 @@ public final class HttpTransport implements AutoCloseable {
         h.set("Connection", "keep-alive");
         h.set("X-Accel-Buffering", "no"); // 让 nginx 等反向代理不要缓冲，否则流式会变成整段返回
         ex.sendResponseHeaders(200, 0); // 0 = chunked，长度未知
+        // 注意：SSE 不走 sendBytes，所以状态码得在这里自己记一笔。
+        // 漏了这一步的话，所有流式请求在审计里都会记成 status=0（"未及应答"），
+        // 看起来全是失败——这恰恰是审计最不该犯的错，靠翻审计日志才发现。
+        RequestScope.current().ifPresent(scope -> scope.responded(200));
         return new SseWriter(ex.getResponseBody(), namedEvents);
     }
 
@@ -486,6 +561,10 @@ public final class HttpTransport implements AutoCloseable {
         out.put("activeStreams", activeStreams.size());
         out.put("auth", guard.enabled() ? "api-key" : "disabled(loopback only)");
         out.put("ui", uiAssets.available() ? "built" : "not built (run: cd ui && npm run build)");
+        out.put("rateLimit", config.rateLimitEnabled()
+                ? config.rateLimitPerMin() + "/min per caller" : "disabled");
+        out.put("audit", (auditLog.file() == null ? "memory only" : auditLog.file().toString())
+                + " · total=" + auditLog.total() + " dropped=" + auditLog.dropped());
         return out;
     }
 
@@ -509,6 +588,35 @@ public final class HttpTransport implements AutoCloseable {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("tools", tools);
         out.put("count", tools.size());
+        return out;
+    }
+
+    /**
+     * 审计查询（U17）：谁 / 何时 / 调了什么 / 结果。
+     *
+     * <p>注意这里也受鉴权保护——审计记录本身就是敏感信息（能看出谁在用、在调什么）。
+     */
+    private Map<String, Object> auditReport(Map<String, String> q) {
+        int limit = (int) Math.max(1, Math.min(500, parseLong(q.get("limit"), 50)));
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (RequestAudit a : auditLog.recent(limit)) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("ts", a.ts().toString());
+            row.put("identity", a.identity());
+            row.put("ip", a.clientIp());
+            row.put("method", a.method());
+            row.put("path", a.path());
+            row.put("status", a.status());
+            row.put("durationMs", a.durationMs());
+            row.put("note", a.note());
+            rows.add(row);
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("total", auditLog.total());
+        out.put("dropped", auditLog.dropped());
+        out.put("persisted", auditLog.file() == null ? null : auditLog.file().toString());
+        out.put("count", rows.size());
+        out.put("records", rows);
         return out;
     }
 
@@ -568,6 +676,7 @@ public final class HttpTransport implements AutoCloseable {
     }
 
     private void sendBytes(HttpExchange ex, int status, String contentType, byte[] body) throws IOException {
+        RequestScope.current().ifPresent(scope -> scope.responded(status));
         ex.getResponseHeaders().set("Content-Type", contentType);
         ex.sendResponseHeaders(status, body.length == 0 ? -1 : body.length);
         if (body.length > 0) {

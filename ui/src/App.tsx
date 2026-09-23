@@ -5,12 +5,13 @@ import { HttpAgent } from '@ag-ui/client'
 
 import { ToolCard, type ToolInfo } from './ToolCard'
 import { Timeline } from './Timeline'
+import { loadApiKey, saveApiKey } from './apiKey'
 import './styles.css'
 
 import '@copilotkit/react-ui/styles.css'
 
 /**
- * U07a + U07b：CopilotKit 聊天面（直连自己的 AG-UI 后端）+ 工具卡片 + 过程时间线。
+ * U07a/U07b + U16：CopilotKit 聊天面（直连自己的 AG-UI 后端）+ 工具卡片 + 过程时间线。
  *
  * ## 为什么是「直连」而不是「runtimeUrl」
  * 常规用法是前端 → CopilotKit runtime（一个 Node 服务）→ 你的 agent。
@@ -20,7 +21,8 @@ import '@copilotkit/react-ui/styles.css'
  * ## ⚠️ 两条必须知道的限制
  * 1. **这个 prop 名字里就写着 unsafe_dev_only**：它是官方给本地开发用的口子。
  *    生产要走 `selfManagedAgents`（CopilotKit 的付费档）或架一个 runtime 做代理。
- * 2. 直连意味着**鉴权、CORS、限流全部由我们自己的端点负责**。
+ * 2. 直连意味着**鉴权、CORS、限流全由我们自己的端点负责**，provider 不会替你带任何东西 ——
+ *    所以开了鉴权之后，API Key 得我们自己往三处塞（见 apiKey.ts 的注释）。
  */
 const AGENT_PATH = '/agui/run'
 
@@ -39,36 +41,60 @@ export function App() {
   const [threadId, setThreadId] = useState(newThreadId)
   const [tools, setTools] = useState<ToolInfo[]>([])
   const [showTimeline, setShowTimeline] = useState(true)
+  const [apiKey, setApiKey] = useState(loadApiKey)
+  const [toolsError, setToolsError] = useState<string | null>(null)
 
   // 工具清单从后端拿，而不是把 'shell'/'echo' 写死在界面里 —— 加一个新工具，卡片自动跟上
   useEffect(() => {
     let alive = true
-    fetch('/tools')
-      .then((r) => r.json())
-      .then((d: { tools: ToolInfo[] }) => {
+    setToolsError(null)
+    fetch('/tools', {
+      // 后端开了鉴权时这一条也必须带 key，否则静默拿到 401、工具卡片全空
+      headers: apiKey ? { 'X-API-Key': apiKey } : undefined,
+    })
+      .then(async (r) => {
+        if (!r.ok) {
+          throw new Error(r.status === 401 ? '需要 API Key（右上角填）' : `HTTP ${r.status}`)
+        }
+        return r.json() as Promise<{ tools: ToolInfo[] }>
+      })
+      .then((d) => {
         if (alive) setTools(d.tools ?? [])
       })
-      .catch(() => {
-        /* 拿不到就不渲染工具卡片，聊天本身不受影响 */
+      .catch((e: Error) => {
+        if (alive) {
+          setTools([])
+          setToolsError(e.message)
+        }
       })
     return () => {
       alive = false
     }
-  }, [])
+  }, [apiKey])
 
   // 匹配规则是精确工具名，所以每个工具一条渲染器。
   // 这里不写类型断言：让 TS 在传 prop 时校验（写错形状会当场报错，而不是运行时静默不渲染）
-  const renderToolCalls = useMemo(() => tools.map((t) => ({ name: t.name, render: ToolCard })), [tools])
-
-  const agents = useMemo(
-    () => ({
-      default: new HttpAgent({ url }),
-    }),
-    [url],
+  const renderToolCalls = useMemo(
+    () => tools.map((t) => ({ name: t.name, render: ToolCard })),
+    [tools],
   )
 
-  const resetThread = useCallback(() => {
-    setThreadId(newThreadId())
+  // key 变了必须重建 agent，否则请求头一直是旧的
+  const agents = useMemo(
+    () => ({
+      default: new HttpAgent({
+        url,
+        headers: apiKey ? { 'X-API-Key': apiKey } : undefined,
+      }),
+    }),
+    [url, apiKey],
+  )
+
+  const resetThread = useCallback(() => setThreadId(newThreadId()), [])
+
+  const onKeyChange = useCallback((value: string) => {
+    setApiKey(value)
+    saveApiKey(value)
   }, [])
 
   return (
@@ -86,20 +112,22 @@ export function App() {
             </p>
           </div>
           <div className="links">
+            <input
+              type="password"
+              className="key-input"
+              placeholder="API Key（后端开了鉴权才需要）"
+              value={apiKey}
+              onChange={(e) => onKeyChange(e.target.value)}
+              autoComplete="off"
+            />
             <button type="button" className="ghost" onClick={resetThread}>
               新会话
             </button>
             <button type="button" className="ghost" onClick={() => setShowTimeline((v) => !v)}>
               {showTimeline ? '隐藏时间线' : '显示时间线'}
             </button>
-            <a href="/tools" target="_blank" rel="noreferrer">
-              工具清单
-            </a>
-            <a href="/health" target="_blank" rel="noreferrer">
-              健康检查
-            </a>
-            <a href="/" target="_blank" rel="noreferrer">
-              调试控制台
+            <a href="/audit" target="_blank" rel="noreferrer">
+              审计
             </a>
           </div>
         </header>
@@ -117,12 +145,17 @@ export function App() {
               }}
             />
           </section>
-          {showTimeline && <Timeline threadId={threadId} />}
+          {showTimeline && <Timeline threadId={threadId} apiKey={apiKey || undefined} />}
         </main>
 
         <footer className="page-foot">
-          工具卡片 {tools.length ? `已注册 ${tools.length} 个（${tools.map((t) => t.name).join(' · ')}）` : '加载中…'}
+          {toolsError
+            ? `工具清单未加载：${toolsError}`
+            : tools.length
+              ? `工具卡片已注册 ${tools.length} 个（${tools.map((t) => t.name).join(' · ')}）`
+              : '工具清单加载中…'}
           {tools.some((t) => t.executesCommands) && ' · 标注"会执行命令"的工具受策略拦截'}
+          {!apiKey && ' · 未填 API Key（后端未开鉴权时可忽略）'}
         </footer>
       </div>
     </CopilotKit>

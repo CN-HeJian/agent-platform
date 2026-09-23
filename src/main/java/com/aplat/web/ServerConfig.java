@@ -17,6 +17,9 @@ import java.util.Map;
  *                            （TCP 已收到 FIN 但本地缓冲还能写），第二次才 EPIPE，
  *                            所以订阅回收最多滞后 2 个周期。要更快就把这个值调小。
  *   APLAT_CORS_ANY_ORIGIN    默认 true，只为开发态方便接前端（生产应收紧）
+ *   APLAT_RATE_LIMIT_PER_MIN 默认 120，按调用方隔离的每分钟请求上限；0 = 不限
+ *   APLAT_AUDIT_FILE         可选；设置后审计记录追加写入该文件（JSON Lines）。
+ *                            不设则只留内存环形缓冲 —— 重启即丢，见 README 的取舍说明。
  * </pre>
  */
 public record ServerConfig(
@@ -24,15 +27,20 @@ public record ServerConfig(
         int port,
         String apiKey,
         long heartbeatMillis,
-        boolean corsAnyOrigin) {
+        boolean corsAnyOrigin,
+        int rateLimitPerMin,
+        String auditFile) {
 
     public static final String ENV_HOST = "APLAT_HTTP_HOST";
     public static final String ENV_PORT = "APLAT_HTTP_PORT";
     public static final String ENV_API_KEY = "APLAT_API_KEY";
     public static final String ENV_HEARTBEAT = "APLAT_SSE_HEARTBEAT_MS";    public static final String ENV_CORS = "APLAT_CORS_ANY_ORIGIN";
+    public static final String ENV_RATE_LIMIT = "APLAT_RATE_LIMIT_PER_MIN";
+    public static final String ENV_AUDIT_FILE = "APLAT_AUDIT_FILE";
 
     public static final int DEFAULT_PORT = 8787;
     public static final long DEFAULT_HEARTBEAT_MS = 15_000L;
+    public static final int DEFAULT_RATE_LIMIT_PER_MIN = 120;
 
     public ServerConfig {
         if (host == null || host.isBlank()) {
@@ -43,10 +51,13 @@ public record ServerConfig(
         }
         apiKey = apiKey == null || apiKey.isBlank() ? null : apiKey;
         heartbeatMillis = heartbeatMillis <= 0 ? DEFAULT_HEARTBEAT_MS : heartbeatMillis;
+        rateLimitPerMin = Math.max(0, rateLimitPerMin);
+        auditFile = auditFile == null || auditFile.isBlank() ? null : auditFile;
     }
 
     public static ServerConfig defaults() {
-        return new ServerConfig("127.0.0.1", DEFAULT_PORT, null, DEFAULT_HEARTBEAT_MS, true);
+        return new ServerConfig("127.0.0.1", DEFAULT_PORT, null, DEFAULT_HEARTBEAT_MS, true,
+                DEFAULT_RATE_LIMIT_PER_MIN, null);
     }
 
     /** 从环境变量读取，缺省即用默认值。 */
@@ -61,24 +72,41 @@ public record ServerConfig(
                 intOf(env.get(ENV_PORT), DEFAULT_PORT),
                 env.get(ENV_API_KEY),
                 longOf(env.get(ENV_HEARTBEAT), DEFAULT_HEARTBEAT_MS),
-                boolOf(env.get(ENV_CORS), true));
+                boolOf(env.get(ENV_CORS), true),
+                intOf(env.get(ENV_RATE_LIMIT), DEFAULT_RATE_LIMIT_PER_MIN),
+                env.get(ENV_AUDIT_FILE));
     }
 
     public ServerConfig withPort(int newPort) {
-        return new ServerConfig(host, newPort, apiKey, heartbeatMillis, corsAnyOrigin);
+        return new ServerConfig(host, newPort, apiKey, heartbeatMillis, corsAnyOrigin,
+                rateLimitPerMin, auditFile);
     }
 
     public ServerConfig withApiKey(String newKey) {
-        return new ServerConfig(host, port, newKey, heartbeatMillis, corsAnyOrigin);
+        return new ServerConfig(host, port, newKey, heartbeatMillis, corsAnyOrigin,
+                rateLimitPerMin, auditFile);
     }
 
     public ServerConfig withHeartbeatMillis(long ms) {
-        return new ServerConfig(host, port, apiKey, ms, corsAnyOrigin);
+        return new ServerConfig(host, port, apiKey, ms, corsAnyOrigin, rateLimitPerMin, auditFile);
+    }
+
+    public ServerConfig withRateLimitPerMin(int limit) {
+        return new ServerConfig(host, port, apiKey, heartbeatMillis, corsAnyOrigin, limit, auditFile);
+    }
+
+    public ServerConfig withAuditFile(String file) {
+        return new ServerConfig(host, port, apiKey, heartbeatMillis, corsAnyOrigin,
+                rateLimitPerMin, file);
     }
 
     /** 是否需要鉴权：只有配了 key 才校验（完整版 RBAC 见 U25）。 */
     public boolean authEnabled() {
         return apiKey != null;
+    }
+
+    public boolean rateLimitEnabled() {
+        return rateLimitPerMin > 0;
     }
 
     public String baseUrl() {

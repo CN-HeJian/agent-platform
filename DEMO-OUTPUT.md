@@ -445,5 +445,110 @@ data: {"type":"CUSTOM_INPUT_CLAIMED","sessionId":"s-rawcheck","seq":1,...}
 最终改用联合类型自己的结构判别：`result !== undefined` ⇔ 这次调用已结束。
 比依赖枚举名更稳——枚举改了、或者它本来就不是字符串枚举，这里都不会坏。
 
+---
+
+# U16 鉴权 + U17 审计与限流
+
+## 单元测试
+
+```
+Tests run: 160, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+## 真实运行（鉴权开启 + 限流 8/min + 审计落盘）
+
+```
+=== 已启动 http://127.0.0.1:8792 ===
+鉴权    : X-API-Key 已启用（/health 与 /ui/ 静态资源豁免）
+```
+
+**鉴权**（同一条 `/run`，只差有没有带 key）：
+
+```
+$ curl -X POST /run -d '{"input":"rm -rf /"}'                  → 401
+$ curl -X POST /run -H 'X-API-Key: ***' -d '{"input":"你好"}'   → 200
+$ curl /health                                                 → 200（探针豁免）
+$ curl /audit                                                  → 401（审计也要 key）
+```
+
+**限流**（8/min）：连打 12 次
+
+```
+200 200 200 200 200 200 200 200 429 429 429 429
+
+HTTP/1.1 429
+Retry-after: 8
+{"error":"RATE_LIMITED","message":"too many requests (limit 8/min); retry after 8s"}
+```
+
+**审计**（`/audit` 读出来的最近几条）：
+
+```
+total = 18 | dropped = 0 | persisted = .../logs/audit.jsonl
+  POST /run   429  id=298754db  note=rate_limited  0ms
+  POST /run   429  id=298754db  note=rate_limited  0ms
+```
+
+`id=298754db` 是**密钥指纹**（SHA-256 前 8 位），不是密钥本身。
+
+**落盘的 JSON Lines**（19 行，首尾两条）：
+
+```
+{"ts":"...","identity":"(rejected)","ip":"127.0.0.1","method":"POST","path":"/run","status":401,"durationMs":20,"note":"unauthorized"}
+{"ts":"...","identity":"298754db","ip":"127.0.0.1","method":"POST","path":"/run","status":200,"durationMs":28,"note":""}
+...
+{"ts":"...","identity":"298754db","ip":"127.0.0.1","method":"POST","path":"/run","status":429,"durationMs":0,"note":"rate_limited"}
+{"ts":"...","identity":"298754db","ip":"127.0.0.1","method":"GET","path":"/audit","status":200,"durationMs":1,"note":""}
+```
+
+**密钥原文泄漏检查：含密钥原文的行数 = 0**（31 条记录，身份只有 `(rejected)` 与 `298754db`）。
+
+## 前端带 key 的三条路（真浏览器验收）
+
+CDP 驱动无头 Chrome：先看没填 key，再写 `localStorage` 刷新。
+
+```
+未填 key 时页脚: 工具清单未加载：需要 API Key（右上角填） · 未填 API Key（后端未开鉴权时可忽略）
+填 key 后页脚:   工具卡片已注册 3 个（echo · add · shell） · 标注"会执行命令"的工具受策略拦截
+
+toolCardCount: 1     toolCardText: ["shell | echo hello-from-http | 已完成 | 参数 | … | 结果 | hello-from-http"]
+timelineRowCount: 11 含 CUSTOM_INPUT_CLAIMED … RUN_FINISHED
+```
+
+三条路各自都通了：聊天（`HttpAgent.headers`）、时间线（`?apiKey=`——`EventSource` 不能自定义请求头）、
+工具清单（`fetch` 头）。截图见 `docs/screenshots/ui-04-auth-enabled.png`。
+
+**没填 key 时给的是明确提示，不是空列表** —— 静默失败的界面比报错的界面难查得多。
+
+## 审计日志当场抓出了我自己的一个 bug
+
+翻那 31 条记录时看到这么一行：
+
+```
+POST /agui/run   0   id=298754db   note=-
+```
+
+`status=0` 在我这里的语义是"处理链抛异常、没来得及应答"（`failed()` 为真）。
+也就是说**所有流式请求在审计里都被记成了失败**——恰恰是审计最不该犯的错。
+
+原因：SSE 走 `startSse()` 里的 `sendResponseHeaders(200, 0)`，**不经过 `sendBytes()`**，
+而我只在 `sendBytes()` 里记了状态码。修法是在 `startSse()` 里也记一笔。
+
+这件事本身就说明审计值得做：这个 bug 不影响任何功能、单测也测不出来，
+**只有把真实流量摊开看才会发现**。修完补了 `streamedRequestsAreAuditedAs200`，
+并把"流式端点同样受鉴权保护（不带 key 是 401 而不是 200）"钉进同一个用例。
+
+## 另一个被测试抓出来的缺陷：关服务时丢审计
+
+`AuditLog.close()` 最初对写线程调了 `interrupt()`。写线程多半正阻塞在队列 `poll` 上，
+一打断就抛 `InterruptedException` 直接退出循环——**队列里还没落盘的记录被整批丢掉**。
+正是最需要审计的时候（关服务）丢得最干净。
+
+改成：置位 `running=false`，让写线程按自己的轮询节奏排空后自然退出；
+只有 2 秒还没排空才强断，并且**把"丢了多少条"打到 stderr**。
+回归用例：`closeDrainsPendingRecords`（塞 200 条立刻 close，断言文件里就是 200 行）。
+
+
 
 
