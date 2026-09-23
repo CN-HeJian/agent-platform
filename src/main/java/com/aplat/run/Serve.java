@@ -7,7 +7,9 @@ import com.aplat.loop.LoopBudget;
 import com.aplat.sandbox.DockerSandbox;
 import com.aplat.sandbox.ProcessSandbox;
 import com.aplat.seam.LlmAdapter;
+import com.aplat.seam.Store;
 import com.aplat.seam.Sandbox;
+import com.aplat.store.StoreFactory;
 import com.aplat.tools.DefaultToolPolicy;
 import com.aplat.web.HttpTransport;
 import com.aplat.web.ServerConfig;
@@ -32,6 +34,11 @@ import com.aplat.web.ServerConfig;
  *   # 人工确认（U12）。默认就是 ask：能执行命令的服务，"先问"才是诚实的默认值
  *   export APLAT_HITL=ask              # allow = 不问人直接放行；deny = 直接拒绝
  *   export APLAT_HITL_TIMEOUT_SEC=120  # 无人应答的等待上限
+ *
+ *   # 持久化（U18）。不设 = 内存，重启即丢
+ *   export APLAT_DB_URL=jdbc:mysql://127.0.0.1:3306/aplat
+ *   export APLAT_DB_USER=root
+ *   export APLAT_DB_PASSWORD=
  * </pre>
  *
  * 注意用 {@code exec:java@serve} 而不是 {@code -Dexec.mainClass}：POM 里显式配置的
@@ -41,6 +48,15 @@ import com.aplat.web.ServerConfig;
  * 默认只监听 127.0.0.1：这个服务能执行 shell，不该在你不注意的时候对外可达。
  */
 public final class Serve {
+
+    /** 一行说清"数据存在哪、重启会不会丢"——这是本地开发最容易踩的认知坑。 */
+    private static String describeStore(Store store) {
+        if (store instanceof com.aplat.store.JdbcStore jdbc) {
+            String where = jdbc.url().replaceAll("(?i)(password=)[^;&]*", "$1***");
+            return jdbc.id() + "  ← 重启不丢（" + where + "）";
+        }
+        return store.id() + "  ← ⚠ 重启即丢；要持久化就设 APLAT_DB_URL";
+    }
 
     public static void main(String[] args) throws Exception {
         ServerConfig config = ServerConfig.fromEnv();
@@ -59,10 +75,15 @@ public final class Serve {
                         .thenText("已在沙箱中执行命令，输出为 hello-from-http。")
                         .repeat();
 
+        // 持久化：配了 APLAT_DB_URL 就用 JDBC（MySQL 或 H2），没配就内存。
+        // 注意这里会**真的连一次库**（JdbcStore 构造时建表）——连不上就启动失败，
+        // 因为"配了库却悄悄退回内存"是最糟的结果：跑得好好的，直到重启才发现数据全丢了。
+        Store store = StoreFactory.fromEnv();
+
         // HITL 走工厂：InteractiveHitl 要把 hitl.requested 写进会话日志，
         // 而日志是内核建的——所以它只能在装配过程里被创建（见 Platform 的注释）。
         Platform platform = Platform.assemble(llm, sandbox, LoopBudget.defaults(),
-                DefaultToolPolicy.fromEnv(),
+                DefaultToolPolicy.fromEnv(), store,
                 log -> InteractiveHitl.fromEnv(log, System.getenv()));
 
         System.out.println("=== 装配清单 ===");
@@ -73,9 +94,13 @@ public final class Serve {
         System.out.println("LLM     : " + llm.id() + (realModel ? "（真实服务）" : "（离线脚本）"));
         System.out.println("Sandbox : " + sandbox.description());
         System.out.println("HITL    : " + platform.hitl().id());
+        System.out.println("Store   : " + describeStore(store));
 
         HttpTransport transport = new HttpTransport(platform, config).start();
-        Runtime.getRuntime().addShutdownHook(new Thread(transport::close, "shutdown"));
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            transport.close();
+            platform.close(); // 关掉可关闭的组件（现在是 JDBC store，将来是连接池）
+        }, "shutdown"));
 
         String base = transport.baseUrl();
         System.out.println();

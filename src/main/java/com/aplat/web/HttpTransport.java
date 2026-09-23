@@ -588,6 +588,8 @@ public final class HttpTransport implements AutoCloseable {
         out.put("hitl", approvals == null
                 ? platform.hitl().id()
                 : platform.hitl().id() + " · " + approvals.pending().size() + " pending");
+        // 持久化状态必须在健康检查里：排查"数据为什么丢了"时，第一件事就是看这里
+        out.put("store", describeStore());
         out.put("audit", (auditLog.file() == null ? "memory only" : auditLog.file().toString())
                 + " · total=" + auditLog.total() + " dropped=" + auditLog.dropped());
         return out;
@@ -765,6 +767,14 @@ public final class HttpTransport implements AutoCloseable {
         out.put("count", rows.size());
         out.put("records", rows);
         return out;
+    }
+
+    /** 一行说清"数据存在哪、重启会不会丢"。内存实现要显式标出来。 */
+    private String describeStore() {
+        if (platform.store() instanceof com.aplat.store.JdbcStore jdbc) {
+            return jdbc.id() + " · " + jdbc.stats();
+        }
+        return platform.store().id() + " · 重启即丢";
     }
 
     private Map<String, Object> kernelReport() {

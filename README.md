@@ -20,7 +20,8 @@
 | 沙箱：容器 / 进程双实现 | `sandbox/` | ✅ 容器不可用自动降级 |
 | 上下文预算 + 分层压缩 + 双记录 | `context/` | ✅ |
 | OpenAI 兼容适配器（D1） | `llm/OpenAiCompatibleAdapter` | ✅ 零 SDK 依赖 |
-| 内存 Store（MySQL 的契约参照） | `store/InMemoryStore` | ✅ |
+| **MySQL 持久化（U18）** | `store/JdbcStore` + `store/StoreFactory` | ✅ 同一份 SQL 跑 MySQL / H2；事件、快照、幂等键重启不丢 |
+| 内存 Store（MySQL 的契约参照） | `store/InMemoryStore` | ✅ 不配数据库就是它，零外部依赖 |
 | 装配根 | `run/Platform` | ✅ |
 | **HTTP + SSE 传输层（U02）** | `web/` | ✅ 零新增依赖（JDK HttpServer + 虚拟线程） |
 | **AG-UI 规范端点（U08）** | `session/AgUiProjector` + `POST /agui/run` | ✅ 事件形状符合规范，客户端可直连 |
@@ -32,7 +33,7 @@
 | **工具卡片 + 过程时间线（U07b）** | `ui/src/ToolCard.tsx` · `ui/src/Timeline.tsx` | ✅ 工具参数/结果可视化；原始事件实时可见 |
 | **人工确认 HITL（U12/U13）** | `hitl/InteractiveHitl` + `ui/src/ApprovalPanel.tsx` | ✅ once / always / deny / modify / timeout 五条路径，全程留痕 |
 
-**尚未做**（按计划属后续需求单元）：MySQL Store（U18）、MCP 接入（U24）、耐久状态机（U19/U20）、
+**尚未做**（按计划属后续需求单元）：MCP 接入（U24）、耐久状态机（U19/U20）、
 RBAC（U25）、多模态与协作（U27+）、可观测台（U23）。
 
 ---
@@ -51,9 +52,19 @@ RBAC（U25）、多模态与协作（U27+）、可观测台（U23）。
 # 前端（U07a）：只需构建一次，产物由上面的服务托管在 /ui/
 cd ui && npm install && npm run build && cd ..
 
-# 单元测试
+# 单元测试（不需要数据库，也不需要 Docker）
 ./mvnw test
+
+# 带持久化起服务（U18）：先建库，再把 URL 给它
+#   mysql -u root -e 'CREATE DATABASE aplat CHARACTER SET utf8mb4'
+export APLAT_DB_URL='jdbc:mysql://127.0.0.1:3306/aplat'
+export APLAT_DB_USER=root APLAT_DB_PASSWORD=你的密码
+./mvnw -q compile exec:java@serve
 ```
+
+> **不设 `APLAT_DB_URL` 就是内存实现**（启动横幅会标 `⚠ 重启即丢`）。
+> 配了库却连不上时**启动直接失败**——悄悄退回内存是最糟的结果：
+> 服务跑得好好的，直到某次重启才发现数据全没了。
 
 > `exec:java@serve` 这个写法是必须的：POM 的 `<configuration>` 里显式写了 `mainClass`，
 > 此时 `-Dexec.mainClass=` **会被忽略**（配置优先级高于用户属性），
@@ -186,6 +197,37 @@ const agents = { default: new HttpAgent({ url: `${location.origin}/agui/run` }) 
 > 而那个枚举**没有从公开入口导出**。所以卡片改用联合类型自己的结构判别
 > （`result !== undefined` ⇔ 调用已结束），不引用任何枚举成员。
 
+### 持久化（U18）
+
+```bash
+export APLAT_DB_URL='jdbc:mysql://127.0.0.1:3306/aplat'
+export APLAT_DB_USER=root APLAT_DB_PASSWORD=
+./mvnw -q compile exec:java@serve
+# Store   : store.jdbc[mysql]  ← 重启不丢（jdbc:mysql://127.0.0.1:3306/aplat）
+```
+
+四张表，语义一眼能看出来（`SHOW CREATE TABLE` 就够）：
+
+| 表 | 存什么 | 为什么是它 |
+|---|---|---|
+| `aplat_events` | 会话事件（主键 `(session_id, seq)`） | 主键即"不重不乱"的保证，回放与续传都靠它 |
+| `aplat_session_seq` | 每条会话的下一个序号 | 取号要**原子**，所以必须有独立的一行来加锁 |
+| `aplat_snapshots` | 每条会话的最新检查点 | U19/U20 的崩溃恢复从这里读 |
+| `aplat_idempotency` | 幂等键 → 引用 | 唯一主键即幂等，不需要应用层加锁 |
+
+**同一份 SQL 既跑 MySQL 也跑 H2** —— 这不是巧合：整类只有**一处**方言假设
+（取号用的 `ON DUPLICATE KEY UPDATE`），H2 只要开 `MODE=MySQL` 就支持，
+而 URL 里没写 `MODE=MySQL` 时构造会直接报错（否则会在某次 append 上神秘地失败）。
+所以"开发用 H2、部署用 MySQL"是**换一个 URL**，不是换一套代码。
+
+**时间戳存 `BIGINT` 毫秒，不存 `DATETIME`。** JDBC 驱动会用 JVM 默认时区解释 `DATETIME`，
+于是同一行在不同时区的机器上读出来差几小时——而这种偏差看起来"只是有点怪"，
+在日志里极难发现。代价是不能直接用 MySQL 的日期函数查，要按日期查得另建生成列。
+
+**取号不读 `MAX(seq)`**：并发下两个事务都会读到 5、都想写 6。这里用
+`INSERT ... ON DUPLICATE KEY UPDATE next_seq = next_seq + 1` 一条语句完成"有则加一、无则建一"，
+再用同一个事务读回——这一行会锁到提交为止，于是**同一会话的取号天然串行，不同会话互不影响**。
+
 ### 人工确认（U12 + U13）
 
 **默认就是 `ask`。** 一个能执行 shell 的服务，"先问"才是诚实的默认值——
@@ -232,6 +274,9 @@ curl -s -X POST -H 'X-API-Key: dev-secret' -H 'Content-Type: application/json' \
 | `APLAT_CORS_ANY_ORIGIN` | `true` | 开发态方便前端；生产应收紧 |
 | `APLAT_RATE_LIMIT_PER_MIN` | `120` | 按调用方隔离的每分钟请求上限；`0` = 不限 |
 | `APLAT_AUDIT_FILE` | 空 | 设了就落盘为 JSON Lines；不设只留内存（重启即丢） |
+| `APLAT_DB_URL` | 空 | **不设 = 内存实现（重启即丢）**；设了走 JDBC（`jdbc:mysql:` 或 `jdbc:h2:…;MODE=MySQL`） |
+| `APLAT_DB_USER` | `root` | 数据库用户 |
+| `APLAT_DB_PASSWORD` | 空 | 数据库口令（用 `APLAT_DB_*` 而不是塞进 URL，避免密码进 shell 历史与进程列表） |
 | `APLAT_HITL` | `ask` | `ask` = 停等人批准；`allow` = 不问人直接放行；`deny` = 直接拒绝 |
 | `APLAT_HITL_TIMEOUT_SEC` | `120` | 无人应答的等待上限；到点按超时处理（与「拒绝」区分） |
 
@@ -272,7 +317,7 @@ run/Demo            ← 离线段到端演示
   ├─ session/       EventSourcedSessionLog / AgUiMapper（信封）/ AgUiProjector（AG-UI 规范）
   ├─ web/           HttpTransport / SseWriter / EventPump / ServerConfig / UiAssets
   │                 ApiKeyGuard（U16）/ RequestScope · AuditLog（U17）/ RateLimiter（U17）
-  └─ store/         InMemoryStore（Store 契约的参照实现）
+  └─ store/         JdbcStore（MySQL/H2 一套 SQL）+ StoreFactory（由环境变量选）+ InMemoryStore
 ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产物由 /ui/ 托管
   ├─ src/App.tsx        聊天面装配：直连 HttpAgent + 工具卡片渲染器 + 时间线
   ├─ src/ToolCard.tsx   工具调用卡片（参数 / 结果 / 被拒标红）
@@ -301,7 +346,10 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
 | `SandboxTest` | sandbox：执行 / 超时 / 退出码 / Docker 不可用降级 / 危险命令拦截 |
 | `BudgetContextProviderTest` | context：预算裁剪 / 分层压缩 / **双记录可归因** |
 | `AgentLoopTest` | **U04 验收**：3 步任务完成 · 编造工具名能自纠 · 预算终止 · 拒绝后改道 · 异常收口 |
-| `StoreContractTest` | store：seq 单调 / 增量 / 快照 / 幂等键 —— **日后 MySQL 实现继承这套断言** |
+| `StoreContract`（抽象契约） | store：seq 单调 / 增量 / 快照往返（含 null 字段）/ 幂等键 / **并发写不丢不重** |
+| `InMemoryStoreTest` | 内存实现跑上面那套契约（它是**参照物**，证明契约本身可满足） |
+| `JdbcStoreTest` | JDBC 实现跑**同一套契约**（H2 MySQL 模式）+ **重启可恢复** + H2 缺 `MODE=MySQL` 时启动报错 |
+| `MySqlStoreTest` | **同一套契约跑在真 MySQL 上**（默认跳过，见下方跑法）——"可替换"最硬的证据 |
 | `SseWriterTest` | **U02**：帧格式 / data 单行 / **无名帧**（不写 `event:`，否则 `onmessage` 收不到）/ 写失败唤醒等待者 |
 | `ApiKeyGuardTest` | **U16 前置**：三种携带方式 / 错误 key 全拒 |
 | `EventPumpTest` | **U09**：回填与实时的重叠不重推、竞态窗口不漏事件 |
@@ -318,8 +366,17 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
 | `HitlEndpointTest` | **U12/U13 验收**：run 挂住等人 → 队列可见 → 回答后继续跑并**真的执行了** · 409 / 400 / 501 / 401 |
 | （`ToolPipelineTest` 4d/4e） | **U13 加固**：改参后**重新过策略**（否则"人改参"就是个后门）· 改参必须是合法 JSON 对象 |
 
-`StoreContractTest` 的用法是有意的：写 MySQL 实现时不要另写一套测试，让它跟内存实现
-跑同一组断言。这才是"可替换"的证明方式。
+`StoreContract` 的用法是有意的：**不为新实现另写一套测试**，让它跟内存实现跑同一组断言。
+这才是"可替换"的证明方式——不是"我写了个 MySQL 实现"，而是"两个实现在同一份契约下都通过"。
+
+真 MySQL 的验收默认跳过（`mvn test` 不该要求本机有库），要跑就显式指向一个**专用测试库**
+（它会清表）：
+
+```bash
+mysql -u root -e 'CREATE DATABASE aplat_test CHARACTER SET utf8mb4'
+APLAT_IT_DB_URL='jdbc:mysql://127.0.0.1:3306/aplat_test' APLAT_IT_DB_USER=root \
+  ./mvnw test -Dtest=MySqlStoreTest -DfailIfNoSpecifiedTests=false
+```
 
 ---
 
@@ -327,8 +384,13 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
 
 - **`ProcessSandbox` 不是安全边界**：与宿主同权限，只用于没有 Docker 的开发环境。生产必须切
   容器沙箱。
-- **内存 Store 重启即丢**：MySQL 实现是 U18 的事，接口已就位（`store/InMemoryStore` 的
-  `id` 是 `store.in-memory`，将来并列一个 `store.mysql`）。
+- **不设 `APLAT_DB_URL` 时 Store 是内存的，重启即丢**：现在有 `store.jdbc[mysql]` 可选了，
+  但**默认仍然是不持久化**（为了让 `mvn test` 与离线演示零依赖）。启动横幅与 `/health`
+  都会把当前用的是哪种标出来——排查"数据为什么丢了"第一件事就是看那里。
+- **审计日志、限流计数、HITL 放行表还没进数据库**：它们各自在内存里（审计可选落 JSON Lines 文件）。
+  该不该塞进 `Store` 是个设计问题而不是顺手的事——审计是 append-only 的**文本流**，
+  与"事件溯源"的语义不同，直接复用 `aplat_events` 会把两件事混成一件。
+  多实例共享要的是"计数/放行表"的共享存储，那更接近 U26 的议题。
 - **token 估算用 chars/4 启发式**：够触发裁剪，不用于计费。真实用量取 provider 的 `usage`。
 - **`McpClient` / `Durable` 只有接口**：阶段二实现。现在装配不绑它们，`ctx.optional()` 取用时
   返回 `empty` 而不是抛异常——这就是"缺失即降级"。
@@ -361,7 +423,8 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
   这是刻意的——断线多半是网络抖动，直接取消一个正在进行的任务更糟；
   但也意味着「关掉浏览器」不等于「取消这次待批操作」（要取消就去提交一个 `deny`）。
 - **放行表与待确认队列都只在内存里**：重启即清空，多实例之间也不共享
-  （在 A 实例点了「总是允许」，B 实例还会问）。与限流同一个问题，等共享状态（U18/U26）。
+  （在 A 实例点了「总是允许」，B 实例还会问）。与限流同一个问题：**Store 已经能持久化了，
+  但这三样还没接进去**（见上一条边界）。
 - **前端面板按会话过滤**：只显示当前 thread 的待确认。想看全部会话的待办，
   用 `GET /hitl/pending`（不带 `sessionId`）。
 - **两种事件方言并存**（规范 AG-UI 与本平台信封）：这是刻意的，但有认知成本。
@@ -371,16 +434,19 @@ ui/                 ← 前端（U07a/U07b）：Vite + React + CopilotKit，产�
 
 ## 6. 下一步（按依赖顺序）
 
-1. **U18 MySQL Store**：实现 `Store`，继承 `StoreContractTest`。它一次解决三件事——
-   重启不丢（含审计）、恢复有了地基（U19/U20）、限流与 HITL 放行表有了跨实例共享的落点。
-2. **U19/U20 耐久**：实现 `Durable`，`resume()` 用最近快照 + 其后事件重建。
-   现在 `AgentLoop` 只写 `state.snapshot` 事件、并不消费 `Store` 的快照接口，
-   所以崩溃后**不会真的续跑**——这是入口，不是 bug。
+1. **U19/U20 耐久**：实现 `Durable`，`resume()` 用最近快照 + 其后事件重建。
+   现在 `AgentLoop` 只写 `state.snapshot` 事件、并不**消费** `Store` 的快照接口，
+   所以崩溃后**不会真的续跑**——地基（`aplat_snapshots` 表 + `latestSnapshot()`）已经在了，
+   缺的是"谁来读它、从哪一步接上"。这是 U18 之后最该做的一件。
+2. **把审计接进 Store**：审计现在是"可选落 JSON Lines 文件"，进程崩了会丢最后几条。
+   接进来之后"谁在什么时候调了什么"才真正跨重启可用。注意别直接复用 `aplat_events`（见边界那节）。
 3. **U24 MCP**：工具会在运行中动态出现，届时要让 `/tools` 的变更能推给前端（当前是启动时拉一次），
    并让 MCP 工具也能声明 `commandField`，从而自动落进策略与确认门控。
 4. **U25 RBAC + 密钥管理**：把「一个共享 key」升级成按用户/角色的授权与轮转；
    HITL 的放行表也该跟着变成「按角色可放行哪些工具」。
-5. **U22 调度**：定时任务若碰到需要批准的工具，要决定是「提前批准」还是「到点没人就跳过」——
+5. **连接池（HikariCP）**：现在每次操作开一条连接，本地够用；`JdbcStore.Connections`
+   这个 supplier 就是为此留的缝。换池之前别急着上多实例——单实例的瓶颈先量一下再动手。
+6. **U22 调度**：定时任务若碰到需要批准的工具，要决定是「提前批准」还是「到点没人就跳过」——
    这是 HITL 与调度交叉处唯一需要新设计的地方。
 
 每一项都能独立开发、独立测试、独立交付——这正是需求单元化的目的。

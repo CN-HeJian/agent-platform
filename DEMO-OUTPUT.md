@@ -728,3 +728,159 @@ w.future.complete(decision);            // ③ 唤醒
 ```
 
 顺带说一句：这个竞态单跑一次通常碰不上，是"跑 40 次 + 断言不变量"的写法把它逼出来的。
+
+---
+
+# U18 MySQL 持久化：真实运行记录
+
+环境说明：本机原本**没有 MySQL**，也没有 Docker、没有 brew。为了做真实验收，
+下载了 MySQL 8.4.6 的 macOS arm64 tarball（167MB）到
+`~/.workbuddy/binaries/mysql/`，`mysqld --initialize-insecure` 初始化了一个独立实例，
+跑在 **127.0.0.1:3307**（不占用默认 3306，也不碰宿主机任何已有配置）。
+
+```
+$ mysqld --initialize-insecure --datadir=<...>/data --basedir=<...>
+$ mysqld --datadir=<...>/data --port=3307 --socket=/tmp/mysql-aplat.sock --mysqlx=0 --bind-address=127.0.0.1
+[System] [MY-010931] mysqld: ready for connections. Version: '8.4.6'  port: 3307
+$ mysql -h 127.0.0.1 -P 3307 -u root --skip-password -e 'CREATE DATABASE aplat CHARACTER SET utf8mb4'
+```
+
+## 一、同一套契约测试，跑在真 MySQL 上
+
+这是"可替换"最硬的证据：**不为新实现另写测试**，让它跟内存实现跑同一份断言。
+
+```
+$ export APLAT_IT_DB_URL='jdbc:mysql://127.0.0.1:3307/aplat_test' APLAT_IT_DB_USER=root
+$ ./mvnw test -Dtest=MySqlStoreTest -DfailIfNoSpecifiedTests=false
+
+[INFO] Tests run: 11, Failures: 0, Errors: 0 -- in com.aplat.store.MySqlStoreTest
+[INFO] BUILD SUCCESS
+```
+
+那 11 个用例里包含**并发写不丢不重**（8 线程 × 40 次追加同一会话 → 320 条，
+断言 seq 恰好是 1..320 且无重复、无空洞）与**并发首写同一个新会话**（8 个线程同时
+给一个还不存在的会话取号——这是取号实现最容易翻车的地方）。
+
+同一套契约在 H2 上也跑：
+
+```
+[INFO] Tests run: 16, Failures: 0, Errors: 0 -- in com.aplat.store.JdbcStoreTest
+[INFO] Tests run:  9, Failures: 0, Errors: 0 -- in com.aplat.store.InMemoryStoreTest
+```
+
+> 顺带一个观察：H2 那 16 个用例花了 **9.5 秒**，MySQL 这 11 个只花 **2.4 秒**。
+> 差异主要来自每次操作都新开一条连接——H2 的建连开销比 MySQL 大得多。
+> 这正是 `JdbcStore.Connections` 那个 supplier 留缝的原因：换 HikariCP 是替换它，不是改逻辑。
+
+## 二、服务起来后用真库
+
+```
+Store   : store.jdbc[mysql]  ← 重启不丢（jdbc:mysql://127.0.0.1:3307/aplat）
+
+$ curl -s $BASE/health -H "X-API-Key: $K"
+  store = store.jdbc[mysql] · {dialect=mysql, events=0, sessions=0, snapshots=0, idempotencyKeys=0}
+```
+
+四张表在建表时创建（`events=0` 说明建好了但还空着）。
+
+## 三、跑一个 turn（含人工确认），然后直连数据库看行
+
+```
+$ curl -X POST $BASE/run -d '{"input":"用 shell 打印当前目录","sessionId":"s-mysql"}'   # 后台，会挂住等人
+$ curl -s "$BASE/hitl/pending?sessionId=s-mysql"     → requestId = h1
+$ curl -X POST $BASE/hitl/h1 -d '{"decision":"once"}'
+{"requestId":"h1","decision":"once","accepted":true}
+
+# run 返回：
+{"sessionId":"s-mysql","status":"COMPLETED","steps":2,"finalText":"已在沙箱中执行命令，输出为 hello-from-http。","events":13}
+```
+
+mysql 客户端直接查（**这就是落库的样子，不是我拼出来的**）：
+
+```
+mysql> SELECT session_id, next_seq FROM aplat_session_seq;
++------------+----------+
+| session_id | next_seq |
++------------+----------+
+| s-mysql    |       13 |
++------------+----------+
+
+mysql> SELECT seq, event_type, CHAR_LENGTH(payload) AS payload_len, ts_millis
+    -> FROM aplat_events WHERE session_id='s-mysql' ORDER BY seq;
++-----+------------------+-------------+---------------+
+| seq | event_type       | payload_len | ts_millis     |
++-----+------------------+-------------+---------------+
+|   1 | input.claimed    |          42 | 1790155076016 |
+|   2 | turn.started     |          26 | 1790155076037 |
+|   3 | context.prepared |          62 | 1790155076051 |
+|   4 | step.started     |          10 | 1790155076064 |
+|   5 | tool.call        |          94 | 1790155076080 |
+|   6 | hitl.requested   |         135 | 1790155076095 |
+|   7 | hitl.resolved    |          63 | 1790155079170 |
+|   8 | tool.result      |         103 | 1790155079193 |
+|   9 | state.snapshot   |          46 | 1790155079203 |
+|  10 | context.prepared |          62 | 1790155079213 |
+|  11 | step.started     |          10 | 1790155079223 |
+|  12 | llm.chunk        |          50 | 1790155079232 |
+|  13 | turn.closed      |          93 | 1790155079240 |
++-----+------------------+-------------+---------------+
+```
+
+seq 6 与 seq 7 的时间戳差 **3075 ms** —— 那正是我在另一个终端里手动点"批准"所花的时间。
+人机往返的耗时也一并落在库里了。
+
+## 四、U18 的核心验收：**杀掉进程再起来**
+
+```
+=== 重启前 ===
+  store = store.jdbc[mysql] · {dialect=mysql, events=13, sessions=1, ...}
+
+=== 杀掉服务进程（模拟宕机/部署）===
+  重启前探测 /health → 502（连不上是预期的）
+
+=== 重新起服务（同一个 MySQL）===
+=== 重启后 ===
+  store = store.jdbc[mysql] · {dialect=mysql, events=13, sessions=1, ...}
+
+=== 重启后读同一个会话（内存实现这里必然是 0 条）===
+  count = 13
+  # 1 CUSTOM_INPUT_CLAIMED      # 8 TOOL_CALL_END
+  # 2 RUN_STARTED                # 9 STATE_SNAPSHOT
+  # 3 CUSTOM_CONTEXT_PREPARED    #10 CUSTOM_CONTEXT_PREPARED
+  # 4 STEP_STARTED               #11 STEP_STARTED
+  # 5 TOOL_CALL_START            #12 TEXT_MESSAGE_CONTENT
+  # 6 CUSTOM_HITL_REQUESTED      #13 RUN_FINISHED
+  # 7 CUSTOM_HITL_RESOLVED
+
+=== 重启后继续同一个会话 ===
+{"sessionId":"s-mysql","status":"COMPLETED","steps":2,"finalText":"已在沙箱中执行命令，输出为 hello-from-http。","events":26}
+
+mysql> SELECT session_id, next_seq FROM aplat_session_seq;
+| s-mysql | 26 |
+
+mysql> SELECT MIN(seq) AS min_seq, MAX(seq) AS max_seq, COUNT(*) AS n FROM aplat_events WHERE session_id='s-mysql';
+|       1 |      26 | 26 |
+```
+
+**seq 接着 14 往下走，不是从 1 重来**——这条比"能读回来"更重要：
+如果重启后 seq 重新计数，新事件会和历史事件撞号，回放与续传（`Last-Event-ID`）会全部错乱。
+
+## 五、几处刻意的取舍
+
+**同一份 SQL 跑 MySQL 与 H2。** 整类只有一处方言假设：取号用的
+`ON DUPLICATE KEY UPDATE`（H2 在 `MODE=MySQL` 下支持，实测过：
+`MEDIUMTEXT` / `DATETIME(3)` / `INSERT IGNORE` / `FOR UPDATE` 也都支持）。
+URL 里没写 `MODE=MySQL` 时构造直接抛——否则会在某次 append 上神秘地语法报错，
+而那个错很难让人联想到是 URL 少了三个词。
+
+**取号不读 `MAX(seq)`，也不用"锁行 + 插行"。** 前者在并发下必然撞号；后者在行
+还不存在时留了个真竞态（两个事务的 gap lock 是兼容的，都会去插，其中一个必然撞主键）。
+最终是一条语句完成"有则加一、无则建一"，同一个事务里读回，竞态窗口消失。
+
+**时间戳存 `BIGINT` 毫秒。** 用 `DATETIME` 的话，JDBC 驱动会按 JVM 默认时区解释它，
+同一行在不同时区的机器上读出来差几小时。这类偏差在日志里看起来"只是有点怪"，
+极难定位。
+
+**连不上就启动失败。** 配了 `APLAT_DB_URL` 却连不上时**不退回内存实现**：
+悄悄降级会让服务照常起来、日志照常写，直到某次重启才发现数据全在内存里。
+这条有测试（`unreachableDatabaseFailsFast`）。

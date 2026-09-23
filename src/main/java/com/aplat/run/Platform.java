@@ -28,7 +28,7 @@ import java.util.List;
  *
  * <p>换成 Spring 时，这个类就是一份 {@code @Configuration}。
  */
-public final class Platform {
+public final class Platform implements AutoCloseable {
 
     public static final String DEFAULT_SYSTEM_PROMPT = """
             你是一个通用 Agent。你可以调用工具来完成任务。
@@ -41,14 +41,16 @@ public final class Platform {
     private final AgentLoop loop;
     private final SessionLog sessionLog;
     private final Hitl hitl;
+    private final Store store;
     private final List<String> policyWarnings;
 
-    private Platform(Kernel kernel, AgentLoop loop, SessionLog sessionLog, Hitl hitl,
+    private Platform(Kernel kernel, AgentLoop loop, SessionLog sessionLog, Hitl hitl, Store store,
                      List<String> policyWarnings) {
         this.kernel = kernel;
         this.loop = loop;
         this.sessionLog = sessionLog;
         this.hitl = hitl;
+        this.store = store;
         this.policyWarnings = List.copyOf(policyWarnings);
     }
 
@@ -65,7 +67,7 @@ public final class Platform {
      */
     public static Platform assemble(LlmAdapter llm, Sandbox sandbox, Hitl hitl, LoopBudget budget,
                                     ToolPolicy policy) {
-        return build(llm, sandbox, budget, policy, log -> hitl);
+        return build(llm, sandbox, budget, policy, new InMemoryStore(), log -> hitl);
     }
 
     /**
@@ -82,11 +84,26 @@ public final class Platform {
     public static Platform assemble(LlmAdapter llm, Sandbox sandbox, LoopBudget budget,
                                     ToolPolicy policy,
                                     java.util.function.Function<SessionLog, Hitl> hitlFactory) {
-        return build(llm, sandbox, budget, policy, hitlFactory);
+        return build(llm, sandbox, budget, policy, new InMemoryStore(), hitlFactory);
+    }
+
+    /**
+     * 带 <b>Store</b> 的装配（U18）。
+     *
+     * <p>换持久化的动作只发生在这里：内核、循环、工具、上下文一行都不动——
+     * 它们只认 {@link Store} 接口。这就是"可替换"落到实处的样子。
+     *
+     * <p>不传 Store 的旧重载用 {@link InMemoryStore}，于是
+     * <b>不配数据库也能跑</b>（`mvn test`、离线演示都靠它）。
+     */
+    public static Platform assemble(LlmAdapter llm, Sandbox sandbox, LoopBudget budget,
+                                    ToolPolicy policy, Store store,
+                                    java.util.function.Function<SessionLog, Hitl> hitlFactory) {
+        return build(llm, sandbox, budget, policy, store, hitlFactory);
     }
 
     private static Platform build(LlmAdapter llm, Sandbox sandbox, LoopBudget budget,
-                                  ToolPolicy policy,
+                                  ToolPolicy policy, Store store,
                                   java.util.function.Function<SessionLog, Hitl> hitlFactory) {
         ToolRegistry tools = new DefaultToolRegistry();
         BuiltinTools.registerAll(tools);
@@ -96,7 +113,7 @@ public final class Platform {
 
         // 先把内核的骨架立起来（Store + SessionLog），才有日志可交给 HITL 工厂
         Kernel.Builder kb = Kernel.builder()
-                .bind(Store.class, new InMemoryStore())
+                .bind(Store.class, store)
                 .withDefaults();
 
         Hitl hitl = hitlFactory.apply(kb.sessionLog());
@@ -118,7 +135,29 @@ public final class Platform {
                 budget,
                 DEFAULT_SYSTEM_PROMPT);
 
-        return new Platform(kernel, loop, kernel.ctx().get(SessionLog.class), hitl, warnings);
+        return new Platform(kernel, loop, kernel.ctx().get(SessionLog.class), hitl, store, warnings);
+    }
+
+    /**
+     * 关掉可关闭的组件。
+     *
+     * <p>现在只有一个候选人（JDBC Store，将来换上连接池才有事可做），
+     * 但入口先留好——"服务停了、数据还留在缓冲里"是那种上线才发现的问题。
+     */
+    @Override
+    public void close() {
+        if (store instanceof AutoCloseable closable) {
+            try {
+                closable.close();
+            } catch (Exception e) {
+                System.err.println("[platform] 关闭 store 失败: " + e);
+            }
+        }
+    }
+
+    /** 当前装配的持久化实现（健康检查与排查用）。 */
+    public Store store() {
+        return store;
     }
 
     /** 装配期发现的安全隐患（空列表 = 干净）。启动时应当打出来。 */
