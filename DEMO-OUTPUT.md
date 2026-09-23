@@ -495,14 +495,18 @@ total = 18 | dropped = 0 | persisted = .../logs/audit.jsonl
 **落盘的 JSON Lines**（19 行，首尾两条）：
 
 ```
-{"ts":"...","identity":"(rejected)","ip":"127.0.0.1","method":"POST","path":"/run","status":401,"durationMs":20,"note":"unauthorized"}
+{"ts":"...","identity":"anonymous","ip":"127.0.0.1","method":"POST","path":"/run","status":401,"durationMs":20,"note":"unauthorized"}
 {"ts":"...","identity":"298754db","ip":"127.0.0.1","method":"POST","path":"/run","status":200,"durationMs":28,"note":""}
 ...
 {"ts":"...","identity":"298754db","ip":"127.0.0.1","method":"POST","path":"/run","status":429,"durationMs":0,"note":"rate_limited"}
 {"ts":"...","identity":"298754db","ip":"127.0.0.1","method":"GET","path":"/audit","status":200,"durationMs":1,"note":""}
 ```
 
-**密钥原文泄漏检查：含密钥原文的行数 = 0**（31 条记录，身份只有 `(rejected)` 与 `298754db`）。
+**密钥原文泄漏检查：含密钥原文的行数 = 0**（31 条记录，身份只有 `anonymous` 与 `298754db`）。
+
+> 身份字段第一版写的是 `(rejected)`，翻审计时看到 `GET /ui/  status=200  id=(rejected)` 才发现不对：
+> **身份答的是"谁"，不是"结果"**。把它改成 `anonymous`，结果交给 `status` 与 `note` 表达
+> （401 + `note=unauthorized` 才是真的被拒）。
 
 ## 前端带 key 的三条路（真浏览器验收）
 

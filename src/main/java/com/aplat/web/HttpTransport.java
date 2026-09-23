@@ -160,7 +160,13 @@ public final class HttpTransport implements AutoCloseable {
         String clientIp = clientIpOf(ex);
         java.util.Optional<String> identified =
                 guard.identify(ex.getRequestHeaders()::getFirst, query(ex).get("apiKey"));
-        RequestScope scope = RequestScope.begin(identified.orElse("(rejected)"), clientIp, method, path);
+        // 认不出身份就记 anonymous，**不要**记成"(rejected)"——
+        // 身份字段回答的是"谁"，不是"结果"。把结果塞进身份会让
+        // "免鉴权的公开资源被放行（200）"也看起来像被拒（我第一版就是这么错的，
+        // 翻审计时看到 `GET /ui/ 200 id=(rejected)` 才反应过来）。
+        // 结果由 status 与 note 表达：401 + note=unauthorized 才是真的被拒。
+        RequestScope scope = RequestScope.begin(
+                identified.orElse(ApiKeyGuard.ANONYMOUS), clientIp, method, path);
         long startedAt = System.nanoTime();
 
         try {

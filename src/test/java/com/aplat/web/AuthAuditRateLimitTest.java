@@ -101,8 +101,10 @@ class AuthAuditRateLimitTest {
 
         RequestAudit record = find(transport.auditLog().recent(50), "/run", 401).orElseThrow(
                 () -> new AssertionError("未授权请求必须留痕: " + transport.auditLog().recent(50)));
-        assertEquals("(rejected)", record.identity());
+        assertEquals(ApiKeyGuard.ANONYMOUS, record.identity(),
+                "身份字段答的是「谁」，不是「结果」——被拒这件事由 status=401 + note=unauthorized 表达");
         assertEquals("unauthorized", record.note());
+        assertTrue(record.failed());
     }
 
     @Test
