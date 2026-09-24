@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<!--
+  U29 运营台。刻意只用原生 JS + 三个只读端点：
+  运营台的价值在于"一眼看到现在有什么、什么坏了"，而不在于界面本身。
+  它读的全是服务端已经暴露过的事实（/admin/overview 与 /usage），没有自己的逻辑。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aplat 运营台</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e8ee; --dim:#8b93a7; --ok:#3fb950; --bad:#f85149; --warn:#d29922; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; }
+  header h1 { margin:0; font-size:16px; font-weight:600; }
+  header .meta { color:var(--dim); font-size:12px; }
+  main { padding:20px 24px 48px; max-width:1100px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:20px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  .card .k { color:var(--dim); font-size:12px; }
+  .card .v { font-size:24px; font-weight:600; margin-top:4px; }
+  .card .v.bad { color:var(--bad); } .card .v.ok { color:var(--ok); } .card .v.warn { color:var(--warn); }
+  section { margin-top:24px; }
+  h2 { font-size:14px; margin:0 0 10px; color:var(--dim); font-weight:600; letter-spacing:.4px; }
+  table { width:100%; border-collapse:collapse; background:var(--panel);
+          border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line); font-size:13px; }
+  th { color:var(--dim); font-weight:500; }
+  tr:last-child td { border-bottom:none; }
+  code { background:#0b0d12; padding:1px 5px; border-radius:3px; font-size:12px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; border:1px solid var(--line); }
+  .pill.ok { color:var(--ok); } .pill.bad { color:var(--bad); } .pill.warn { color:var(--warn); }
+  .empty { color:var(--dim); padding:12px; }
+  .err { color:var(--bad); padding:12px; }
+  .hint { color:var(--dim); font-size:12px; margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>aplat 运营台</h1>
+  <span class="meta" id="meta">载入中…</span>
+  <span class="meta" style="margin-left:auto">
+    <label><input type="text" id="key" placeholder="X-API-Key" size="18"> 鉴权</label>
+    <button onclick="load()">刷新</button>
+  </span>
+</header>
+<main>
+  <div class="grid" id="cards"></div>
+
+  <section>
+    <h2>任务（最近的）</h2>
+    <table id="tasks"></table>
+    <div class="hint">CRASHED 与 SUSPENDED 可以续跑；终态（SUCCEEDED/FAILED/CANCELLED）不行。</div>
+  </section>
+
+  <section>
+    <h2>工具用量（调用次数 / 失败次数）</h2>
+    <table id="tools"></table>
+  </section>
+
+  <section>
+    <h2>会话（事件最多的）</h2>
+    <table id="sessions"></table>
+  </section>
+
+  <section>
+    <h2>调度</h2>
+    <table id="schedules"></table>
+  </section>
+
+  <section>
+    <h2>装配（当前到底跑的是哪一套）</h2>
+    <table id="config"></table>
+    <div class="hint">这一页刻意只读：改配置请改环境变量再重启，而不是在这里改——
+      运行时可改的配置最终都会变成"到底哪一份是准的"。</div>
+  </section>
+</main>
+
+<script>
+const API = location.origin;
+
+async function get(path) {
+  const key = document.getElementById('key').value.trim();
+  const headers = key ? { 'X-API-Key': key } : {};
+  const r = await fetch(API + path, { headers });
+  if (!r.ok) throw new Error(path + ' → ' + r.status + ' ' + (await r.text()).slice(0, 200));
+  return r.json();
+}
+
+function el(html) { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstChild; }
+
+function card(k, v, cls) {
+  return `<div class="card"><div class="k">${k}</div><div class="v ${cls || ''}">${v}</div></div>`;
+}
+
+function rows(table, head, body) {
+  const t = document.getElementById(table);
+  if (!body.length) { t.innerHTML = ''; t.appendChild(el('<tr><td class="empty">（空）</td></tr>')); return; }
+  t.innerHTML = '<tr>' + head.map(h => `<th>${h}</th>`).join('') + '</tr>' +
+    body.map(r => '<tr>' + r.map(c => `<td>${c}</td>`).join('') + '</tr>').join('');
+}
+
+function pill(text, ok) {
+  const cls = ok === true ? 'ok' : ok === false ? 'bad' : 'warn';
+  return `<span class="pill ${cls}">${text}</span>`;
+}
+
+async function load() {
+  try {
+    const [ov, usage] = await Promise.all([get('/admin/overview'), get('/usage')]);
+    document.getElementById('meta').textContent =
+      `store=${ov.store} · hitl=${ov.hitl} · 启动 ${new Date(ov.startedAt).toLocaleString()}`;
+
+    const active = ov.tasks.active.length, crashed = (ov.tasks.byState.CRASHED || 0);
+    document.getElementById('cards').innerHTML = [
+      card('会话', ov.sessions),
+      card('事件', ov.events),
+      card('进行中的任务', active, active ? '' : 'ok'),
+      card('崩掉可续跑', crashed, crashed ? 'bad' : 'ok'),
+      card('工具调用', usage.toolCalls, ''),
+      card('工具失败', usage.toolErrors, usage.toolErrors ? 'bad' : 'ok'),
+      card('回放（幂等拦下）', usage.replayed, usage.replayed ? 'warn' : 'ok'),
+      card('人机等待累计', (usage.hitlWaitMillis / 1000).toFixed(1) + 's'),
+    ].join('');
+
+    rows('tasks', ['任务', '会话', '状态', '步', '说明'],
+      ov.tasks.active.concat(ov.tasks.terminal).slice(0, 20).map(t => [
+        `<code>${t.taskId}</code>`, `<code>${t.sessionId}</code>`,
+        pill(t.state, t.state === 'SUCCEEDED' ? true : t.state === 'CRASHED' ? false : null),
+        t.step, (t.detail || '').slice(0, 60)
+      ]));
+
+    const byTool = usage.aplat_tool_calls_by_tool || {};
+    rows('tools', ['工具', '调用', '失败'],
+      Object.keys(byTool).map(name => {
+        const failed = (usage.aplat_tool_errors_by_tool || {})[name] || 0;
+        return [`<code>${name}</code>`, byTool[name], failed ? pill(failed, false) : '0'];
+      }));
+
+    rows('sessions', ['会话', '事件数'],
+      (usage.topSessions || []).map(s => [`<code>${s.sessionId}</code>`, s.events]));
+
+    rows('schedules', ['调度', '触发', '下次', '跑了几次', '上次结果'],
+      (ov.schedules || []).map(s => [
+        `<code>${s.scheduleId}</code>`, s.trigger,
+        s.nextRunAt ? new Date(s.nextRunAt).toLocaleString() : '—',
+        s.runCount, s.lastOutcome || '—'
+      ]));
+
+    rows('config', ['项', '值'], Object.entries(ov.assembly || {}).map(([k, v]) => [k, String(v)]));
+  } catch (e) {
+    document.getElementById('meta').textContent = '载入失败';
+    document.getElementById('cards').innerHTML =
+      `<div class="card"><div class="err">${String(e.message || e)}</div></div>`;
+  }
+}
+
+load();
+// 运营台不需要秒级刷新：30 秒足够看出"现在有什么、什么坏了"，
+// 而且它每次都会扫一遍事件流——刷得太勤会自己把机器压住。
+setInterval(load, 30000);
+</script>
+</body>
+</html>

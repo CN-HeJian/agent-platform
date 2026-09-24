@@ -1,0 +1,16 @@
+{
+  "name": "example-echo",
+  "version": "1.0.0",
+  "tools": [
+    {
+      "name": "echo_args",
+      "description": "把收到的参数原样回显（用来确认插件链路是通的）",
+      "schema": {
+        "type": "object",
+        "properties": { "text": { "type": "string" } },
+        "required": ["text"]
+      },
+      "handler": { "kind": "stdio", "command": "cat" }
+    }
+  ]
+}

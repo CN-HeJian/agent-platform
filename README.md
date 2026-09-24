@@ -37,6 +37,8 @@
 | **容器化（U26）** | `Dockerfile` · `docker-compose.yml` | ⚠ 两阶段 + 非 root + 健康检查；**本机无 Docker，只做静态校验** |
 | **配置即代码（U26）** | `config/env/*.env` · `run/Main` | ✅ 变量名是常量；编排文件被静态校验钉住 |
 | **评测飞轮（U27/U28）** | `eval/` + `exec:java@eval` | ✅ 数据集 + 三级评估器 + 回归对比 + 微调导出 |
+| **运营台（U29）** | `GET /admin` · `/admin/overview` · `/usage` | ✅ 只读；含「崩掉可续跑」与「待批准」两个数字 |
+| **插件 SDK（U30）** | `plugin/` + `plugins/README.md` | ✅ 清单式插件；参数走 stdin；不能覆盖内置工具 |
 | 装配根 | `run/Platform` | ✅ |
 | **HTTP + SSE 传输层（U02）** | `web/` | ✅ 零新增依赖（JDK HttpServer + 虚拟线程） |
 | **AG-UI 规范端点（U08）** | `session/AgUiProjector` + `POST /agui/run` | ✅ 事件形状符合规范，客户端可直连 |
@@ -48,8 +50,7 @@
 | **工具卡片 + 过程时间线（U07b）** | `ui/src/ToolCard.tsx` · `ui/src/Timeline.tsx` | ✅ 工具参数/结果可视化；原始事件实时可见 |
 | **人工确认 HITL（U12/U13）** | `hitl/InteractiveHitl` + `ui/src/ApprovalPanel.tsx` | ✅ once / always / deny / modify / timeout 五条路径，全程留痕 |
 
-**尚未做**（按计划属后续需求单元）：运营台（U29）、插件 SDK（U30）、
-文档解析（U31）、协作（U32）、多租户与 K8s（U33）。
+**尚未做**（按计划属后续需求单元）：文档解析（U31）、协作（U32）、多租户与 K8s（U33）。
 
 ---
 
@@ -299,6 +300,32 @@ export APLAT_DB_URL='jdbc:mysql://127.0.0.1:3307/aplat' APLAT_DB_USER=root APLAT
 
 注意它**拒绝在内存 Store 下运行**：跨进程验证的前提是两个进程看到同一份状态，
 内存实现下这个演示会"成功"但什么也没证明。
+
+### 运营台（U29）与插件 SDK（U30）
+
+**运营台**：`GET /admin`（页面）· `GET /admin/overview` · `GET /usage`。
+
+刻意**只读**：改配置请改环境变量再重启，而不是在这里改——运行时可改的配置最终都会变成
+"到底哪一份是准的"。总览里有两个数字是特意加上的：**崩掉可续跑**（CRASHED + SUSPENDED）
+与**待批准**。这两类都是"安静地坏着"的典型——不报出来，就没人知道有一条任务在等续跑、
+或者有人在等一个批准而没人应答。装配视图里**只出现密钥的变量名，不出现值**。
+
+**插件 SDK**：一个插件 = 一个 JSON 清单文件，放在 `APLAT_PLUGINS` 目录里启动时加载。
+
+```json
+{"name":"qrcode","version":"1.0.0","tools":[
+  {"name":"qrcode_make","description":"把文本做成二维码",
+   "schema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]},
+   "handler":{"kind":"stdio","command":"python3 plugins/qrcode.py"}}]}
+```
+
+命令**写死在清单里**，参数以 JSON 走**stdin**。最容易写出的另一个版本是把参数拼进命令行
+（{@code qrcode.py "用户输入的文本"}）——那样一旦文本里出现 `; rm -rf /`，它就不再是参数了，
+而这就是注入本身。这里参数永远是 stdin 里的一串字节。有测试专门把 `; rm -rf /` 当参数传进去。
+
+两条硬规则：**插件不能覆盖内置工具**（注册表里"后写覆盖"是静默的，于是"我以为我在用受控的
+shell"，实际跑的是某个插件给的东西）；**插件之间不能重名**（否则谁赢取决于加载顺序）。
+加载失败要说清是哪个文件、为什么——目录里躺着五个文件时，"插件加载失败"没有意义。
 
 ### 评测飞轮（U27/U28）
 

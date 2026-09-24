@@ -72,6 +72,7 @@ import java.util.function.Consumer;
 public final class HttpTransport implements AutoCloseable {
 
     private static final String CONSOLE_RESOURCE = "/web/console.html";
+    private static final String ADMIN_RESOURCE = "/web/admin.html";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final Platform platform;
@@ -264,6 +265,12 @@ public final class HttpTransport implements AutoCloseable {
                 sendUiAsset(ex, path);
             } else if (path.equals("/kernel") && method.equals("GET")) {
                 sendJson(ex, 200, kernelReport());
+            } else if ((path.equals("/admin") || path.equals("/admin/")) && method.equals("GET")) {
+                sendAdmin(ex);
+            } else if (path.equals("/admin/overview") && method.equals("GET")) {
+                sendJson(ex, 200, adminOverview());
+            } else if (path.equals("/usage") && method.equals("GET")) {
+                sendJson(ex, 200, usageReport());
             } else if (path.equals("/whoami") && method.equals("GET")) {
                 sendJson(ex, 200, rbac.explain(query(ex).get("sessionId"),
                         platform.tools().specs(), CURRENT.get()));
@@ -778,6 +785,83 @@ public final class HttpTransport implements AutoCloseable {
         // 未结束的 span 一并说清"这意味着什么"，免得看到半个 step 的人以为是采集漏了
         body.put("openSpansNote", "ended=false 的 span 没有结束事件：崩在某一步、或者还在跑");
         sendJson(ex, 200, body);
+    }
+
+    // ---------------------------------------------------------- U29 运营台面
+
+    private void sendAdmin(HttpExchange ex) throws IOException {
+        try (java.io.InputStream in = HttpTransport.class.getResourceAsStream(ADMIN_RESOURCE)) {
+            if (in == null) {
+                sendError(ex, 404, "NO_CONSOLE", "admin resource missing: " + ADMIN_RESOURCE);
+                return;
+            }
+            sendBytes(ex, 200, "text/html; charset=utf-8", in.readAllBytes());
+        }
+    }
+
+    /**
+     * 总览：把"现在有什么、什么坏了"放在一个响应里。
+     *
+     * <p>刻意包含 {@code crashedResumable} 与 {@code openApprovals} 这两个数字——
+     * 它们都是"安静地坏着"的典型：不报出来，就没人知道有一条任务在等续跑、
+     * 或者有人在等一个批准。
+     */
+    private Map<String, Object> adminOverview() {
+        var metrics = new Metrics(platform.store(), platform.sessionLog());
+        Map<String, Object> snap = metrics.snapshot();
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("startedAt", startedAt);
+        out.put("store", describeStore());
+        out.put("sessions", snap.get("aplat_sessions_total"));
+        out.put("events", snap.get("aplat_events_total"));
+        out.put("tasks", tasksReport());
+
+        Map<String, Integer> byState =
+                (Map<String, Integer>) snap.getOrDefault("aplat_tasks_by_state", Map.of());
+        out.put("crashedResumable", byState.getOrDefault("CRASHED", 0) + byState.getOrDefault("SUSPENDED", 0));
+        out.put("tasksByState", byState);
+        out.put("schedules", schedulesReport().get("schedules"));
+        out.put("openApprovals", approvals == null ? 0 : approvals.pending().size());
+        out.put("assembly", assemblyReport());
+        return out;
+    }
+
+    /** 用量报表：调用、失败、回放、人机等待，以及事件最多的会话。 */
+    private Map<String, Object> usageReport() {
+        var metrics = new Metrics(platform.store(), platform.sessionLog());
+        Map<String, Object> snap = metrics.snapshot();
+        Map<String, Object> out = new LinkedHashMap<>(snap);
+
+        // 事件最多的会话：排查"到底是哪一条把机器压住了"时第一个要看的表
+        List<Map<String, Object>> top = new ArrayList<>();
+        for (String sessionId : platform.store().sessionIds()) {
+            int n = platform.sessionLog().events(sessionId).size();
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("sessionId", sessionId);
+            row.put("events", n);
+            top.add(row);
+        }
+        top.sort((a, b) -> (Integer) b.get("events") - (Integer) a.get("events"));
+        out.put("topSessions", top.size() > 10 ? top.subList(0, 10) : top);
+        out.put("note", "全部从事件流聚合，不做进程内计数器——重启后照旧，多副本天然合并");
+        return out;
+    }
+
+    /** 当前装配。密钥**只出现变量名**，不出现值。 */
+    private Map<String, Object> assemblyReport() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("host", config.host());
+        out.put("port", config.port());
+        out.put("authEnabled", config.authEnabled());
+        out.put("rateLimitPerMin", config.rateLimitPerMin());
+        out.put("store", describeStore());
+        out.put("hitl", ScopedHitl.unwrap(platform.hitl()).id());
+        out.put("rbac", rbac.enabled() ? "按角色（" + rbac.principalCount() + " 个身份）" : "未启用");
+        out.put("tools", platform.tools().specs().size());
+        out.put("secretNames", secrets.names());
+        out.put("secretsRedacted", "值一律不显示，只列变量名");
+        return out;
     }
 
     // ------------------------------------------------------ U19/U22 任务与调度面

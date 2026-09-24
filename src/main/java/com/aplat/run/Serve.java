@@ -6,6 +6,7 @@ import com.aplat.hitl.InteractiveHitl;
 import com.aplat.hitl.ScopedHitl;
 import com.aplat.mcp.McpMount;
 import com.aplat.mcp.StdioMcpClient;
+import com.aplat.plugin.PluginLoader;
 import com.aplat.llm.OpenAiCompatibleAdapter;
 import com.aplat.llm.ScriptedLlmAdapter;
 import com.aplat.loop.LoopBudget;
@@ -129,6 +130,12 @@ public final class Serve {
                 ? DefaultToolPolicy.fromEnv().and(rbac.policy())
                 : DefaultToolPolicy.fromEnv();
 
+        // 插件（U30）：也是装配期挂工具。与 MCP 的区别是"本地进程 + stdin 传参"，
+        // 不需要远端服务，也不需要子进程常驻。
+        String pluginDir = System.getenv(PluginLoader.ENV_PLUGINS);
+        PluginLoader plugins = new PluginLoader();
+        java.util.List<String> pluginErrors = new java.util.ArrayList<>();
+
         Platform platform = Platform.assemble(llm, sandbox, LoopBudget.defaults(),
                 policy, store,
                 log -> new ScopedHitl(InteractiveHitl.fromEnv(log, System.getenv()), log),
@@ -138,6 +145,10 @@ public final class Serve {
                                 new StdioMcpClient(endpointCommand), System.getenv());
                         mcpResults.addAll(mount.mount(List.of(endpointCommand)));
                         mounts.add(mount);
+                    }
+                    if (pluginDir != null && !pluginDir.isBlank()) {
+                        var result = plugins.load(java.nio.file.Path.of(pluginDir), reg);
+                        pluginErrors.addAll(result.errors());
                     }
                 });
 
@@ -189,6 +200,12 @@ public final class Serve {
                     + "）；配了它就按角色授权");
         }
         System.out.println("密钥    : " + secrets.describe());
+        System.out.println("插件    : " + (pluginDir == null || pluginDir.isBlank()
+                ? "未配置（设 " + PluginLoader.ENV_PLUGINS + "=<目录> 接入，见 plugins/README.md）"
+                : "目录 " + pluginDir));
+        for (String e : pluginErrors) {
+            System.out.println("          ⚠ " + e);
+        }
 
         String base = transport.baseUrl();
         System.out.println();
