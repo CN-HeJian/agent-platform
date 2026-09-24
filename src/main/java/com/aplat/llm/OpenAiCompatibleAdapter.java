@@ -57,16 +57,27 @@ public final class OpenAiCompatibleAdapter implements LlmAdapter {
         this.client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build();
     }
 
-    /** 从环境变量构造：{@code APLAT_LLM_BASE_URL} / {@code APLAT_LLM_API_KEY} / {@code APLAT_LLM_MODEL}。 */
+    /**
+     * 环境变量名（U25/U26 的约定：**变量名是常量**，读写都用它，不写字面量）。
+     *
+     * <p>为什么较这个真：变量名以字面量散落在代码与文档里时，拼错不会报错，
+     * 表现是「配置没生效」——而没有任何提示。变成常量之后，编排文件与文档
+     * 也被静态校验钉在这几个名字上（见 {@code ContainerAssetsTest}）。
+     */
+    public static final String ENV_BASE_URL = "APLAT_LLM_BASE_URL";
+    public static final String ENV_API_KEY = "APLAT_LLM_API_KEY";
+    public static final String ENV_MODEL = "APLAT_LLM_MODEL";
+
+    /** 从环境变量构造：{@link #ENV_BASE_URL} / {@link #ENV_API_KEY} / {@link #ENV_MODEL}。 */
     public static OpenAiCompatibleAdapter fromEnv() {
-        String base = env("APLAT_LLM_BASE_URL", "https://api.openai.com/v1");
-        String key = env("APLAT_LLM_API_KEY", "");
-        String model = env("APLAT_LLM_MODEL", "gpt-4o-mini");
+        String base = env(ENV_BASE_URL, "https://api.openai.com/v1");
+        String key = env(ENV_API_KEY, "");
+        String model = env(ENV_MODEL, "gpt-4o-mini");
         return new OpenAiCompatibleAdapter(base, key, model);
     }
 
     public static boolean envConfigured() {
-        String key = System.getenv("APLAT_LLM_API_KEY");
+        String key = System.getenv(ENV_API_KEY);
         return key != null && !key.isBlank();
     }
 

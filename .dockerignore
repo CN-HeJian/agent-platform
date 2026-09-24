@@ -1,0 +1,20 @@
+# 构建产物与本地状态：镜像里不该有它们
+target/
+.mvn/wrapper/maven-wrapper.jar
+# 这个仓库的 .git 在几十 MB 量级，而且它记录的是"我们怎么改的"，不是"怎么跑的"
+.git/
+.gitignore
+# 本地运行痕迹：日志、审计、跑出来的数据
+logs/
+*.log
+*.jsonl
+data/
+# 前端依赖：UI 是预构建的静态资源，node_modules 不该进任何镜像
+ui/node_modules/
+ui/dist/
+# 文档与编辑器
+*.md
+!README.md
+.idea/
+*.iml
+.DS_Store

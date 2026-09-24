@@ -41,6 +41,10 @@ public final class McpMount {
 
     private static final JsonLog LOG = JsonLog.of("mcp");
 
+    /** 环境变量名。见 {@code ContainerAssetsTest}：名字必须是常量，否则拼错只会表现为「配置没生效」。 */
+    public static final String ENV_ENDPOINTS = "APLAT_MCP_ENDPOINTS";
+    public static final String ENV_TRUSTED = "APLAT_MCP_TRUSTED";
+
     /** 一个已挂载的端点。 */
     public record Mounted(
             String endpoint,
@@ -81,7 +85,7 @@ public final class McpMount {
      */
     public static McpMount fromEnv(ToolRegistry registry, McpClient client, Map<String, String> env) {
         Set<String> trusted = new LinkedHashSet<>();
-        String raw = env.getOrDefault("APLAT_MCP_TRUSTED", "");
+        String raw = env.getOrDefault(ENV_TRUSTED, "");
         for (String name : raw.split(",")) {
             if (!name.isBlank()) {
                 trusted.add(name.trim());
@@ -91,7 +95,7 @@ public final class McpMount {
     }
 
     public static List<String> endpointsFromEnv(Map<String, String> env) {
-        String raw = env.getOrDefault("APLAT_MCP_ENDPOINTS", "");
+        String raw = env.getOrDefault(ENV_ENDPOINTS, "");
         List<String> out = new ArrayList<>();
         for (String e : raw.split(";")) {
             if (!e.isBlank()) {

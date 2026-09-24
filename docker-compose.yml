@@ -1,0 +1,49 @@
+# U26 编排：应用 + MySQL。
+#
+# 本机没有 Docker，所以这份文件是**静态校验**过的（见 ContainerAssetsTest），
+# 没有做过真实的 compose up。这一点必须写明，否则它读起来像"验过"。
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      # 只用于本地 compose；生产请用 secret 注进来（见 README 的密钥那节）
+      MYSQL_ROOT_PASSWORD: aplat-local-only
+      MYSQL_DATABASE: aplat
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      # 应用起来就要求库可用（连不上会启动失败，这是刻意的），所以这里必须有健康检查，
+      # 否则 depends_on 只会等"容器启动"而不是"库能连"
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # 端口只映射到宿主机的回环地址：这个服务能执行 shell，
+      # 不该在任何人不注意的时候对外可达（与 Serve 默认只听 127.0.0.1 是同一个理由）
+      APLAT_HTTP_HOST: 0.0.0.0
+      APLAT_HTTP_PORT: "8787"
+      APLAT_API_KEY: ${APLAT_API_KEY:?容器里必须显式给一个 API key}
+      APLAT_HITL: ask
+      APLAT_DB_URL: jdbc:mysql://db:3306/aplat
+      APLAT_DB_USER: root
+      APLAT_DB_PASSWORD: aplat-local-only
+      APLAT_RATE_LIMIT_PER_MIN: "120"
+      APLAT_AUDIT_FILE: /app/logs/audit.jsonl
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      # 审计要活过容器重建：它是"谁在什么时候调了什么"的唯一凭据
+      - ./logs:/app/logs
+
+volumes:
+  db-data:

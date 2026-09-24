@@ -34,6 +34,8 @@
 | **MCP 接入（U24）** | `mcp/`（stdio JSON-RPC） | ✅ 真子进程验证；远端工具**默认要确认** |
 | **RBAC（U25）** | `auth/Rbac` + `auth/Role` | ✅ 四个内置角色；**失败时关门**；批准权与执行权分开 |
 | **密钥脱敏（U25）** | `auth/Secrets` | ✅ 统一脱敏出口，审计与横幅都不出现密钥原文 |
+| **容器化（U26）** | `Dockerfile` · `docker-compose.yml` | ⚠ 两阶段 + 非 root + 健康检查；**本机无 Docker，只做静态校验** |
+| **配置即代码（U26）** | `config/env/*.env` · `run/Main` | ✅ 变量名是常量；编排文件被静态校验钉住 |
 | 装配根 | `run/Platform` | ✅ |
 | **HTTP + SSE 传输层（U02）** | `web/` | ✅ 零新增依赖（JDK HttpServer + 虚拟线程） |
 | **AG-UI 规范端点（U08）** | `session/AgUiProjector` + `POST /agui/run` | ✅ 事件形状符合规范，客户端可直连 |
@@ -45,8 +47,7 @@
 | **工具卡片 + 过程时间线（U07b）** | `ui/src/ToolCard.tsx` · `ui/src/Timeline.tsx` | ✅ 工具参数/结果可视化；原始事件实时可见 |
 | **人工确认 HITL（U12/U13）** | `hitl/InteractiveHitl` + `ui/src/ApprovalPanel.tsx` | ✅ once / always / deny / modify / timeout 五条路径，全程留痕 |
 
-**尚未做**（按计划属后续需求单元）：容器化（U26）、评测飞轮（U27/U28）、
-平台化（U29–U33）。
+**尚未做**（按计划属后续需求单元）：评测飞轮（U27/U28）、平台化（U29–U33）。
 
 ---
 
@@ -296,6 +297,36 @@ export APLAT_DB_URL='jdbc:mysql://127.0.0.1:3307/aplat' APLAT_DB_USER=root APLAT
 
 注意它**拒绝在内存 Store 下运行**：跨进程验证的前提是两个进程看到同一份状态，
 内存实现下这个演示会"成功"但什么也没证明。
+
+### 容器化与配置即代码（U26）
+
+```bash
+java -jar target/agent-platform-0.1.0-SNAPSHOT.jar --help     # 一个 jar 走所有模式
+java -jar target/agent-platform-0.1.0-SNAPSHOT.jar serve
+set -a; . config/env/dev.env; set +a; ./mvnw -q compile exec:java@serve   # 用环境配置文件
+```
+
+**先说清楚做到哪一步**：做这个的时候本机没有 Docker，所以 `Dockerfile` 与
+`docker-compose.yml` **只做过静态校验，没有做过 `docker build` / `compose up`**。
+README 的表里那一行也因此标的是 ⚠ 而不是 ✅ —— 写了静态校验就说静态校验。
+
+但静态校验在这里抓到的是真问题，不是形式检查。`ContainerAssetsTest` 会交叉核对：
+
+- **Dockerfile 里的子命令必须在 `run/Main` 的白名单里。** 容器里没有 Maven，
+  起不来的表现是「未知命令」，而那时人已经在排查容器了。
+- **compose / env 文件里出现的每个 `APLAT_*` 变量，代码里都真的读过它。**
+  做法是把源码里所有 `ENV_*` 常量的值扫出来当白名单。这条**当场就抓到了三处真问题**：
+  `APLAT_LLM_BASE_URL` / `APLAT_LLM_API_KEY` / `APLAT_LLM_MODEL` 与
+  `APLAT_MCP_ENDPOINTS` / `APLAT_MCP_TRUSTED` 当时只以字面量存在，
+  文档里却在用——拼错它们的表现是「配置没生效」，而没有任何报错。现在它们是常量。
+- **端口只能绑回环。** compose 里写成 `8787:8787` 等于对全网开放一个能执行命令的服务
+  （与 `Serve` 默认只听 `127.0.0.1` 是同一个理由）。
+- **镜像里不该有的东西**（`target/`、`.git/`、`ui/node_modules/`）在 `.dockerignore` 里。
+
+三处「为什么」值得写下来：**两阶段构建**不只是为了小——单阶段会把 JDK 与整个 m2 缓存带进最终镜像，
+于是镜像里多出成千上万个文件，每一个都是一次「从镜像里捞出一个旧版本的库」的机会。
+**非 root** 是因为这个服务能执行 shell。**健康检查打 `/health`** 而不是探端口：
+只探端口的话，「服务起来了但连不上库」在编排层看来仍是健康的，于是流量照发。
 
 ### 按角色授权：失败时关门（U25）
 
