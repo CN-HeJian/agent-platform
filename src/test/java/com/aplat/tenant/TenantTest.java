@@ -112,6 +112,25 @@ class TenantTest {
     }
 
     @Test
+    @DisplayName("读回来的事件 sessionId 不带前缀——否则前端拿它回连会永远读不到（实测 0 帧）")
+    void returnedEventsHaveBareSessionId() {
+        Tenant.set("acme");
+        var store = new TenantStore(raw, Tenant::current);
+        var log = new EventSourcedSessionLog(store);
+        log.append("s-1", "input.claimed", Map.of("text", "hi"));
+
+        List<SessionEvent> back = store.events("s-1", 0);
+        assertEquals(1, back.size());
+        assertEquals("s-1", back.get(0).sessionId(),
+                "对外必须是裸 id：前端会拿它拼 /agui/events/{id}");
+        assertFalse(back.get(0).sessionId().contains("::"), back.get(0).sessionId());
+
+        // 快照同理
+        store.saveSnapshot(new Store.Snapshot("s-1", "step", "{}", java.time.Instant.now()));
+        assertEquals("s-1", store.latestSnapshot("s-1").orElseThrow().sessionId());
+    }
+
+    @Test
     @DisplayName("K8s 清单：与 Dockerfile / 代码里的常量一致（静态校验，本机没有集群）")
     void k8sManifestsAreConsistent() throws Exception {
         Path dir = Path.of("k8s");

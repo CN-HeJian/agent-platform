@@ -45,6 +45,14 @@ public final class TenantStore implements Store {
         return tenant() + "::" + sessionId;
     }
 
+    /** 剥掉本租户前缀；不是本租户的就原样返回（那种情况不该发生，但也不该替它改）。 */
+    private String strip(String stored) {
+        String prefix = tenant() + "::";
+        return stored != null && stored.startsWith(prefix)
+                ? stored.substring(prefix.length())
+                : stored;
+    }
+
     @Override
     public String id() {
         return delegate.id() + "[tenant]";
@@ -63,9 +71,24 @@ public final class TenantStore implements Store {
                 event.type(), event.payload(), event.ts()));
     }
 
+    /**
+     * 读回来时**必须把前缀剥掉**。
+     *
+     * <p>不剥的后果不是"看着别扭"，而是会话在界面上消失：事件里的 {@code sessionId}
+     * 会变成 {@code acme::s-1}，前端拿它回连 {@code /agui/events/acme::s-1}，
+     * 而这一层会再给它加一次前缀（{@code acme::acme::s-1}）——于是永远读不到。
+     * 实测就是这样：裸 id 13 帧，带前缀 0 帧。
+     *
+     * <p>库里存什么是对外不可见的细节，租户外看到的就是他自己的 id。
+     */
     @Override
     public List<SessionEvent> events(String sessionId, long afterSeq) {
-        return delegate.events(session(sessionId), afterSeq);
+        List<SessionEvent> stored = delegate.events(session(sessionId), afterSeq);
+        List<SessionEvent> out = new java.util.ArrayList<>(stored.size());
+        for (SessionEvent e : stored) {
+            out.add(new SessionEvent(strip(e.sessionId()), e.seq(), e.type(), e.payload(), e.ts()));
+        }
+        return out;
     }
 
     @Override
@@ -89,7 +112,9 @@ public final class TenantStore implements Store {
 
     @Override
     public Optional<Snapshot> latestSnapshot(String sessionId) {
-        return delegate.latestSnapshot(session(sessionId));
+        return delegate.latestSnapshot(session(sessionId))
+                .map(snap -> new Snapshot(strip(snap.sessionId()), snap.stepId(),
+                        snap.stateJson(), snap.ts()));
     }
 
     @Override
