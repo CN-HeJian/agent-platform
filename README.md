@@ -39,6 +39,9 @@
 | **评测飞轮（U27/U28）** | `eval/` + `exec:java@eval` | ✅ 数据集 + 三级评估器 + 回归对比 + 微调导出 |
 | **运营台（U29）** | `GET /admin` · `/admin/overview` · `/usage` | ✅ 只读；含「崩掉可续跑」与「待批准」两个数字 |
 | **插件 SDK（U30）** | `plugin/` + `plugins/README.md` | ✅ 清单式插件；参数走 stdin；不能覆盖内置工具 |
+| **文档解析（U31）** | `doc/` + `read_document` 工具 | ✅ txt/md · csv · json · pdf（最小实现，会自述不确定） |
+| **工作区与评论（U32）** | `workspace/` + `/workspaces` | ✅ 共享会话；评论挂在**具体的事件**上 |
+| **多租户（U33）** | `tenant/TenantStore` | ✅ 隔离做在存储层；sessionId 也加前缀；K8s 清单（静态校验） |
 | 装配根 | `run/Platform` | ✅ |
 | **HTTP + SSE 传输层（U02）** | `web/` | ✅ 零新增依赖（JDK HttpServer + 虚拟线程） |
 | **AG-UI 规范端点（U08）** | `session/AgUiProjector` + `POST /agui/run` | ✅ 事件形状符合规范，客户端可直连 |
@@ -50,7 +53,8 @@
 | **工具卡片 + 过程时间线（U07b）** | `ui/src/ToolCard.tsx` · `ui/src/Timeline.tsx` | ✅ 工具参数/结果可视化；原始事件实时可见 |
 | **人工确认 HITL（U12/U13）** | `hitl/InteractiveHitl` + `ui/src/ApprovalPanel.tsx` | ✅ once / always / deny / modify / timeout 五条路径，全程留痕 |
 
-**尚未做**（按计划属后续需求单元）：文档解析（U31）、协作（U32）、多租户与 K8s（U33）。
+阶段一到阶段三的 33 个需求单元**已全部落地**。剩下的不是"没做"，而是明确记在
+[第 5 节「已知边界」](#5-已知边界不要误会它已经完整)里的事：完整 cron、多副本租约、连接池等。
 
 ---
 
@@ -300,6 +304,40 @@ export APLAT_DB_URL='jdbc:mysql://127.0.0.1:3307/aplat' APLAT_DB_USER=root APLAT
 
 注意它**拒绝在内存 Store 下运行**：跨进程验证的前提是两个进程看到同一份状态，
 内存实现下这个演示会"成功"但什么也没证明。
+
+### 文档解析、协作与多租户（U31–U33）
+
+**文档解析（U31）**：`read_document` 工具，支持 txt/md、csv、json、PDF。
+
+```bash
+export APLAT_DOCS_DIR=./docs       # 不配就没有这个工具——能读文件的工具不该默认在列表里
+```
+
+- CSV 输出成"字段=值"的行，而不是裸表格：{@code a,b,c} 在第 8 列之后就分不清谁是谁了。
+- **必须有根目录围栏**，判断用 `normalize().startsWith()` 而不是字符串前缀——
+  否则 `docs/../../etc/passwd` 看起来完全合法。有测试专门把 `; rm -rf /` 和 `../..` 传进去。
+- PDF 是**最小实现**（找 stream、需要时用 JDK 的 `Inflater` 解压、抠 `Tj/TJ`）。
+  它做不到的（自定义编码字体、分栏阅读顺序、扫描件）都写在 `warnings` 里：
+  **一个知道自己不确定的解析器，比一个自信地给出乱文本的有用得多。**
+
+**工作区与评论（U32）**：`GET/POST /workspaces`、`POST /workspaces/{id}/share`、
+`GET/POST /workspaces/{id}/comments`。
+
+评论挂在**具体的事件**上（`sessionId#7`）而不是整条会话——"这里用错了工具"只有落在
+那一步才有意义，挂在会话上就变成一段没有上下文的留言板。评论**不写进事件流**：
+它是人写给人看的，进上下文就等于让某个人随口一句变成模型下次的输入。
+
+**多租户（U33）**：`APLAT_RBAC="alice@acme:admin:keyA;bob@globex:viewer:keyB"`。
+
+隔离做在**存储层**（`TenantStore` 给所有 key 加租户前缀），而不是"每个接口自己检查"——
+后者漏一处就是一次越权，而漏掉的那个方法看起来完全正常。**sessionId 也要加前缀**：
+事件表是全局的，而 sessionId 是调用方给的（经常是 `s-1` 这种可猜的东西），
+只隔离命名空间的话 A 租户猜到 id 就能读到 B 的事件。代价是库里存的带前缀，
+直接查库做排查时会看到 `acme::s-1`——这一点写在代码注释里。
+
+K8s 清单（`k8s/`）**只做过静态校验，没有做过 `kubectl apply`**（本机没有集群），
+测试会核对端口 / uid / 探针 / Secret 与 Dockerfile 一致。清单里也写明了上多副本之前
+必须先解决的两件事：`reclaimOrphans()` 与 `Scheduler.tick()` 都假设单实例。
 
 ### 运营台（U29）与插件 SDK（U30）
 

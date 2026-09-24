@@ -5,6 +5,7 @@ import com.aplat.auth.Secrets;
 import com.aplat.hitl.InteractiveHitl;
 import com.aplat.hitl.ScopedHitl;
 import com.aplat.mcp.McpMount;
+import com.aplat.doc.DocumentTool;
 import com.aplat.mcp.StdioMcpClient;
 import com.aplat.plugin.PluginLoader;
 import com.aplat.llm.OpenAiCompatibleAdapter;
@@ -97,7 +98,23 @@ public final class Serve {
         // 持久化：配了 APLAT_DB_URL 就用 JDBC（MySQL 或 H2），没配就内存。
         // 注意这里会**真的连一次库**（JdbcStore 构造时建表）——连不上就启动失败，
         // 因为"配了库却悄悄退回内存"是最糟的结果：跑得好好的，直到重启才发现数据全丢了。
+        Rbac rbac;
+        try {
+            rbac = Rbac.fromEnv(System.getenv());
+        } catch (IllegalArgumentException e) {
+            System.err.println("[启动失败] " + e.getMessage());
+            System.err.println("          格式：APLAT_RBAC=名字:角色:密钥;名字:角色:密钥");
+            System.err.println("          内置角色：" + Role.all().stream().map(Role::describe).toList());
+            System.exit(2);
+            return;
+        }
         Store store = StoreFactory.fromEnv();
+        // 多租户（U33）：真的分了租户就用一层 TenantStore 把 key 全部加前缀。
+        // 隔离做在存储层而不是"每个接口自己检查"——后者漏一处就是一次越权，
+        // 而漏掉的那个方法看起来完全正常。
+        if (rbac.multiTenant()) {
+            store = new com.aplat.tenant.TenantStore(store, com.aplat.tenant.Tenant::current);
+        }
 
         // MCP 接入（U24）：端点来自环境变量，**一个端点一个子进程**（stdio 传输天然如此）。
         // 挂载失败不抛异常——一个 MCP 端点挂掉不该让服务起不来——但结果会被打出来。
@@ -112,16 +129,6 @@ public final class Serve {
         // RBAC（U25）：配了 APLAT_RBAC 就按角色授权，没配就退化成单共享 key（行为与 U16 一致）。
         // 解析失败**直接退出**：一个"我没看懂你的授权配置"的服务，比一个"我用默认配置跑起来了"
         // 的服务危险得多——后者会让所有人都是 admin。
-        Rbac rbac;
-        try {
-            rbac = Rbac.fromEnv(System.getenv());
-        } catch (IllegalArgumentException e) {
-            System.err.println("[启动失败] " + e.getMessage());
-            System.err.println("          格式：APLAT_RBAC=名字:角色:密钥;名字:角色:密钥");
-            System.err.println("          内置角色：" + Role.all().stream().map(Role::describe).toList());
-            System.exit(2);
-            return;
-        }
         Secrets secrets = Secrets.fromEnv(System.getenv());
 
         // 组合策略：RBAC 管"这个人能不能用这个工具"，默认策略管"这条命令能不能跑"。
@@ -134,6 +141,9 @@ public final class Serve {
         // 不需要远端服务，也不需要子进程常驻。
         String pluginDir = System.getenv(PluginLoader.ENV_PLUGINS);
         PluginLoader plugins = new PluginLoader();
+        // 文档工具（U31）：配了 APLAT_DOCS_DIR 才注册。不配就不存在——
+        // 一个能读文件的工具不该默认就在工具列表里。
+        String docsDir = System.getenv(DocumentTool.ENV_DOCS_DIR);
         java.util.List<String> pluginErrors = new java.util.ArrayList<>();
 
         Platform platform = Platform.assemble(llm, sandbox, LoopBudget.defaults(),
@@ -145,6 +155,9 @@ public final class Serve {
                                 new StdioMcpClient(endpointCommand), System.getenv());
                         mcpResults.addAll(mount.mount(List.of(endpointCommand)));
                         mounts.add(mount);
+                    }
+                    if (docsDir != null && !docsDir.isBlank()) {
+                        reg.register(DocumentTool.of(java.nio.file.Path.of(docsDir)));
                     }
                     if (pluginDir != null && !pluginDir.isBlank()) {
                         var result = plugins.load(java.nio.file.Path.of(pluginDir), reg);
@@ -200,6 +213,9 @@ public final class Serve {
                     + "）；配了它就按角色授权");
         }
         System.out.println("密钥    : " + secrets.describe());
+        System.out.println("文档    : " + (docsDir == null || docsDir.isBlank()
+                ? "未启用（设 " + DocumentTool.ENV_DOCS_DIR + "=<目录> 后会出现 " + DocumentTool.NAME + " 工具）"
+                : DocumentTool.NAME + " ← " + docsDir));
         System.out.println("插件    : " + (pluginDir == null || pluginDir.isBlank()
                 ? "未配置（设 " + PluginLoader.ENV_PLUGINS + "=<目录> 接入，见 plugins/README.md）"
                 : "目录 " + pluginDir));

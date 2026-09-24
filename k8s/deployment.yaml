@@ -1,0 +1,63 @@
+# U33 K8s 清单。**本机没有集群，这些文件只做过静态校验**（见 TenantTest / ContainerAssetsTest），
+# 没有做过 kubectl apply。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aplat
+  labels: { app: aplat }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: aplat }
+  template:
+    metadata:
+      labels: { app: aplat }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001      # 与 Dockerfile 里的 aplat 用户一致
+      containers:
+        - name: aplat
+          image: aplat:0.1.0           # 由 CI 构建，见 k8s/README.md
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8787      # 与 Dockerfile 的 EXPOSE / ServerConfig.DEFAULT_PORT 一致
+          env:
+            - name: APLAT_HTTP_HOST
+              value: "0.0.0.0"         # 容器里必须听 0.0.0.0，隔离靠 Service 与 Ingress 决定暴露面
+            - name: APLAT_HTTP_PORT
+              value: "8787"
+            - name: APLAT_HITL
+              value: "ask"             # 生产必须 ask：无人确认时宁可超时，也不能默认放行
+            - name: APLAT_DB_URL
+              value: "jdbc:mysql://mysql:3306/aplat"
+            - name: APLAT_AUDIT_FILE
+              value: "/app/logs/audit.jsonl"   # 挂持久卷：审计活不过重建就没有意义了
+            - name: APLAT_API_KEY
+              valueFrom:
+                secretKeyRef: { name: aplat-secrets, key: api-key }
+            - name: APLAT_RBAC
+              valueFrom:
+                secretKeyRef: { name: aplat-secrets, key: rbac }
+            - name: APLAT_LLM_API_KEY
+              valueFrom:
+                secretKeyRef: { name: aplat-secrets, key: llm-api-key }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          # /health 里含 store 与 hitl 的真实状态，所以用它做 readiness 是对的：
+          # 只探端口的话，"起来了但连不上库"会被判成可用，于是流量照发
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+          volumeMounts:
+            - { name: logs, mountPath: /app/logs }
+      volumes:
+        - name: logs
+          persistentVolumeClaim: { claimName: aplat-logs }

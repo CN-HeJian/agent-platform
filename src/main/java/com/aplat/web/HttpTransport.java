@@ -223,6 +223,8 @@ public final class HttpTransport implements AutoCloseable {
                     : java.util.Optional.of(caller.id());
             if (caller != null) {
                 CURRENT.set(caller);
+                // 租户上下文跟着身份走：库里的 key 会带上租户前缀（见 TenantStore）
+                com.aplat.tenant.Tenant.set(caller.tenant());
             }
         } else {
             identified = guard.identify(ex.getRequestHeaders()::getFirst, query(ex).get("apiKey"));
@@ -286,6 +288,22 @@ public final class HttpTransport implements AutoCloseable {
                 sendJson(ex, 200, pendingApprovals(query(ex)));
             } else if (path.startsWith("/hitl/") && method.equals("POST")) {
                 handleApproval(ex, path.substring("/hitl/".length()));
+            } else if (path.equals("/workspaces") && method.equals("GET")) {
+                sendJson(ex, 200, workspaceList());
+            } else if (path.equals("/workspaces") && method.equals("POST")) {
+                handleCreateWorkspace(ex);
+            } else if (path.startsWith("/workspaces/") && path.endsWith("/comments")
+                    && method.equals("GET")) {
+                handleWorkspaceComments(ex, path.substring("/workspaces/".length(),
+                        path.length() - "/comments".length()));
+            } else if (path.startsWith("/workspaces/") && path.endsWith("/comments")
+                    && method.equals("POST")) {
+                handleAddComment(ex, path.substring("/workspaces/".length(),
+                        path.length() - "/comments".length()));
+            } else if (path.startsWith("/workspaces/") && method.equals("GET")) {
+                handleWorkspace(ex, path.substring("/workspaces/".length()));
+            } else if (path.startsWith("/workspaces/") && method.equals("POST")) {
+                handleWorkspaceAction(ex, path.substring("/workspaces/".length()));
             } else if (path.equals("/tasks") && method.equals("GET")) {
                 sendJson(ex, 200, tasksReport());
             } else if (path.startsWith("/tasks/") && method.equals("POST")) {
@@ -326,8 +344,10 @@ public final class HttpTransport implements AutoCloseable {
         } finally {
             recordAudit(scope, startedAt);
             RequestScope.end();
-            // 线程是复用的：不清掉的话，下一个请求（可能是没带 key 的那个）会继承上一个人的身份
+            // 线程是复用的：不清掉的话，下一个请求（可能是没带 key 的那个）会继承上一个人的
+            // 身份与租户——而"继承了别人的租户"是一次静默的越权
             CURRENT.remove();
+            com.aplat.tenant.Tenant.clear();
             ex.close();
         }
     }
@@ -862,6 +882,128 @@ public final class HttpTransport implements AutoCloseable {
         out.put("secretNames", secrets.names());
         out.put("secretsRedacted", "值一律不显示，只列变量名");
         return out;
+    }
+
+    // ---------------------------------------------------------- U32 协作面
+
+    /** 工作区服务。每次请求新建：它无状态，持有 Store 引用即可。 */
+    private com.aplat.workspace.WorkspaceService workspaces() {
+        return new com.aplat.workspace.WorkspaceService(platform.store());
+    }
+
+    private Map<String, Object> workspaceList() {
+        var service = workspaces();
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("count", service.list().size());
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (var w : service.list()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("id", w.id());
+            row.put("name", w.name());
+            row.put("members", w.members());
+            row.put("sessionIds", w.sessionIds());
+            rows.add(row);
+        }
+        out.put("workspaces", rows);
+        return out;
+    }
+
+    private void handleCreateWorkspace(HttpExchange ex) throws IOException {
+        JsonNode node = readObject(ex);
+        if (node == null) {
+            return;
+        }
+        String id = node.path("id").asText("").trim();
+        String name = node.path("name").asText("").trim();
+        if (id.isEmpty() || name.isEmpty()) {
+            sendError(ex, 400, "MISSING_FIELDS", "id and name are required");
+            return;
+        }
+        var created = workspaces().create(id, name, CURRENT.get() == null
+                ? "anonymous" : CURRENT.get().id());
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("id", created.id());
+        body.put("name", created.name());
+        sendJson(ex, 201, body);
+    }
+
+    private void handleWorkspace(HttpExchange ex, String rawId) throws IOException {
+        try {
+            sendJson(ex, 200, workspaces().view(URLDecoder.decode(rawId, StandardCharsets.UTF_8)));
+        } catch (IllegalArgumentException e) {
+            sendError(ex, 404, "NO_SUCH_WORKSPACE", e.getMessage());
+        }
+    }
+
+    private void handleWorkspaceComments(HttpExchange ex, String rawId) throws IOException {
+        try {
+            var service = workspaces();
+            String id = URLDecoder.decode(rawId, StandardCharsets.UTF_8);
+            List<Map<String, Object>> rows = new ArrayList<>();
+            service.comments(id).forEach(c -> {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("id", c.id());
+                row.put("where", c.where());
+                row.put("author", c.author());
+                row.put("text", c.text());
+                row.put("ts", c.ts());
+                rows.add(row);
+            });
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("workspaceId", id);
+            body.put("count", rows.size());
+            body.put("comments", rows);
+            sendJson(ex, 200, body);
+        } catch (IllegalArgumentException e) {
+            sendError(ex, 404, "NO_SUCH_WORKSPACE", e.getMessage());
+        }
+    }
+
+    private void handleAddComment(HttpExchange ex, String rawId) throws IOException {
+        JsonNode node = readObject(ex);
+        if (node == null) {
+            return;
+        }
+        try {
+            String author = CURRENT.get() == null ? "anonymous" : CURRENT.get().id();
+            var comment = workspaces().comment(
+                    URLDecoder.decode(rawId, StandardCharsets.UTF_8),
+                    node.path("sessionId").asText(""),
+                    node.path("eventSeq").asLong(0),
+                    author,
+                    node.path("text").asText(""));
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("id", comment.id());
+            body.put("where", comment.where());
+            body.put("author", author);
+            sendJson(ex, 201, body);
+        } catch (IllegalArgumentException e) {
+            sendError(ex, 400, "BAD_COMMENT", e.getMessage());
+        }
+    }
+
+    /** {@code POST /workspaces/{id}/share}：把一条会话共享进来。 */
+    private void handleWorkspaceAction(HttpExchange ex, String raw) throws IOException {
+        String tail = URLDecoder.decode(raw, StandardCharsets.UTF_8);
+        int slash = tail.lastIndexOf('/');
+        if (slash <= 0 || !"share".equals(tail.substring(slash + 1))) {
+            sendError(ex, 400, "BAD_WORKSPACE_PATH", "expected /workspaces/<id>/share");
+            return;
+        }
+        JsonNode node = readObject(ex);
+        if (node == null) {
+            return;
+        }
+        try {
+            var updated = workspaces().share(tail.substring(0, slash),
+                    node.path("sessionId").asText(""));
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("id", updated.id());
+            body.put("sessionIds", updated.sessionIds());
+            sendJson(ex, 200, body);
+        } catch (IllegalArgumentException e) {
+            sendError(ex, 400, "BAD_SHARE", e.getMessage());
+        }
     }
 
     // ------------------------------------------------------ U19/U22 任务与调度面

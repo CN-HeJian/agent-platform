@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: aplat
+spec:
+  type: ClusterIP          # 不对集群外直接暴露：这个服务能执行 shell
+  selector: { app: aplat }
+  ports:
+    - name: http
+      port: 8787
+      targetPort: http
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aplat-logs
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 1Gi }

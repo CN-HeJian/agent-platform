@@ -40,7 +40,14 @@ public final class Rbac {
     public static final String ENV_RBAC = "APLAT_RBAC";
 
     /** 身份。id 是**密钥的指纹**（不是密钥本身），日志与审计里只出现它。 */
-    public record Principal(String id, Role role) {
+    /**
+     * 身份（U25/U33）。
+     *
+     * @param tenant 租户。名字写成 {@code alice@acme} 时解析出 "acme"；没写则用
+     *               {@code Tenant.DEFAULT}。它在库里的落法是给 key 加前缀（见 TenantStore），
+     *               所以"不同租户的数据不混"是存储层保证的，不是靠每个接口自己记得检查。
+     */
+    public record Principal(String id, Role role, String tenant) {
 
         public boolean canApprove() {
             return role.canApprove();
@@ -48,13 +55,14 @@ public final class Rbac {
 
         /** 不带 RBAC 配置时的隐含身份。 */
         public static Principal anonymousAdmin() {
-            return new Principal("anonymous", Role.admin());
+            return new Principal("anonymous", Role.admin(), com.aplat.tenant.Tenant.DEFAULT);
         }
 
         public Map<String, Object> view() {
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("principal", id);
             out.put("role", role.name());
+            out.put("tenant", tenant);
             out.put("canApprove", role.canApprove());
             return out;
         }
@@ -92,19 +100,32 @@ public final class Rbac {
                 throw new IllegalArgumentException(
                         "APLAT_RBAC 的每一项必须是 名字:角色:密钥，这一项不是：" + entry.trim());
             }
-            String name = parts[0].trim();
+            String rawName = parts[0].trim();
             Role role = Role.of(parts[1].trim()); // 角色名认不出来会在这里抛
             String key = parts[2].trim();
             if (key.isEmpty()) {
-                throw new IllegalArgumentException("APLAT_RBAC 里 " + name + " 的密钥是空的");
+                throw new IllegalArgumentException("APLAT_RBAC 里 " + rawName + " 的密钥是空的");
             }
-            byKey.put(fingerprint(key), new Principal(name, role));
+            // "alice@acme" → 名字 alice，租户 acme。没有 @ 就归到默认租户——
+            // 于是"不分区"的部署不用改配置，而想分区的人加一个 @ 就行。
+            int at = rawName.indexOf('@');
+            String name = at > 0 ? rawName.substring(0, at) : rawName;
+            String tenant = at > 0 && at < rawName.length() - 1
+                    ? rawName.substring(at + 1)
+                    : com.aplat.tenant.Tenant.DEFAULT;
+            byKey.put(fingerprint(key), new Principal(name, role, tenant));
         }
         return new Rbac(byKey, true);
     }
 
     public boolean enabled() {
         return enabled;
+    }
+
+    /** 是否真的分了租户（有任何身份不在默认租户里）。 */
+    public boolean multiTenant() {
+        return byKeyFingerprint.values().stream()
+                .anyMatch(p -> !com.aplat.tenant.Tenant.DEFAULT.equals(p.tenant()));
     }
 
     public int principalCount() {
@@ -233,6 +254,7 @@ public final class Rbac {
         Principal p = principalOf(sessionId).orElse(null);
         out.put("rbacEnabled", enabled);
         out.put("caller", caller == null ? null : caller.id());
+        out.put("tenant", caller == null ? null : caller.tenant());
         out.put("callerRole", caller == null ? null : caller.role().name());
         out.put("principal", p == null ? null : p.id());
         out.put("role", p == null ? null : p.role().name());
