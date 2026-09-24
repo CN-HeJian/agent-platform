@@ -45,6 +45,19 @@ public interface Store extends Seam {
      */
     List<String> sessionIds();
 
+    /**
+     * 剥掉包装层，拿到**真正落盘的那一层**。
+     *
+     * <p>为什么需要它：按租户加前缀的 {@code TenantStore} 只是一层包装，
+     * 而"数据重启会不会丢"这个问题只有底下那层答得上来。没有这个方法时，
+     * 启动横幅会对着一个 MySQL 库说「重启即丢」——**包装层把一个最要紧的事实说反了**。
+     *
+     * <p>返回 {@code this} 是默认实现，于是绝大多数实现不必关心它。
+     */
+    default Store unwrap() {
+        return this;
+    }
+
     void saveSnapshot(Snapshot snapshot);
 
     Optional<Snapshot> latestSnapshot(String sessionId);

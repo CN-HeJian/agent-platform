@@ -21,6 +21,7 @@ import com.aplat.durable.TaskRecord;
 import com.aplat.schedule.ScheduleSpec;
 import com.aplat.schedule.Trigger;
 import com.aplat.seam.SessionLog;
+import com.aplat.seam.Store;
 import com.aplat.session.AgUiProjector;
 import com.aplat.tools.Json;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -1382,7 +1383,9 @@ public final class HttpTransport implements AutoCloseable {
 
     /** 一行说清"数据存在哪、重启会不会丢"。内存实现要显式标出来。 */
     private String describeStore() {
-        if (platform.store() instanceof com.aplat.store.JdbcStore jdbc) {
+                // 先剥包装（多租户那一层），否则会对着一个 MySQL 库说「重启即丢」
+        Store unwrapped = platform.store().unwrap();
+        if (unwrapped instanceof com.aplat.store.JdbcStore jdbc) {
             return jdbc.id() + " · " + jdbc.stats();
         }
         return platform.store().id() + " · 重启即丢";

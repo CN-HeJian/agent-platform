@@ -71,7 +71,9 @@ public final class Serve {
 
     /** 一行说清"数据存在哪、重启会不会丢"——这是本地开发最容易踩的认知坑。 */
     private static String describeStore(Store store) {
-        if (store instanceof com.aplat.store.JdbcStore jdbc) {
+                // 先剥包装（多租户那一层），否则会对着一个 MySQL 库说「重启即丢」
+        Store unwrapped = store.unwrap();
+        if (unwrapped instanceof com.aplat.store.JdbcStore jdbc) {
             String where = jdbc.url().replaceAll("(?i)(password=)[^;&]*", "$1***");
             return jdbc.id() + "  ← 重启不丢（" + where + "）";
         }

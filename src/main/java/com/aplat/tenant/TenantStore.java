@@ -51,6 +51,11 @@ public final class TenantStore implements Store {
     }
 
     @Override
+    public Store unwrap() {
+        return delegate.unwrap();
+    }
+
+    @Override
     public long append(SessionEvent event) {
         // 换 sessionId 只能重建一条：record 是不可变的（这是好事——
         // 它保证了"事件一旦写下就没人改得动"，而这正是事件溯源的前提）
