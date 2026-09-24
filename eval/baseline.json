@@ -1,0 +1,12 @@
+{
+  "name" : "smoke",
+  "passRate" : 1.0,
+  "cases" : {
+    "chat-only" : true,
+    "shell-echo" : true,
+    "safe-command-blocked" : true,
+    "budget" : true,
+    "unknown-tool" : true
+  },
+  "note" : "这是评测基线：只有 caseId → 通过与通过率。改代码后跑 `exec:java@eval` 会与它对比，报出「原本通过、现在失败」的那些。"
+}

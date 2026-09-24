@@ -127,6 +127,16 @@
               </arguments>
             </configuration>
           </execution>
+          <!--
+            评测飞轮：exec:java@eval 跑一遍并与基线对比；
+            加 exec.args=update-baseline（注意 XML 注释里不能出现连续两个减号）则把当前结果写成新基线。
+          -->
+          <execution>
+            <id>eval</id>
+            <configuration>
+              <mainClass>com.aplat.run.EvalDemo</mainClass>
+            </configuration>
+          </execution>
           <!-- `exec:java@crash -Dexec.args="u20 crash r1"`：真的 halt 掉进程，验证跨进程续跑 -->
           <execution>
             <id>crash</id>
