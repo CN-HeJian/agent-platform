@@ -1068,3 +1068,77 @@ plexus-classworlds，于是子进程一启动就 ClassNotFound——而现象是
 于是得到 `mcp_protobuf_java_4_29_0_echo`——因为命令行里塞着一长串 classpath。
 现在前缀**可以显式指定**（推荐），不指定时取最后一个参数的 basename 去扩展名；
 再猜不出来就退化成一个短哈希（短很重要：前缀会出现在每个工具名里，而工具名进模型上下文）。
+
+---
+
+# U25 RBAC：两个身份、一条被拦下的命令
+
+```
+$ export APLAT_RBAC="alice:admin:keyA;bob:viewer:keyB"
+$ export APLAT_SECRET_ENV=MY_EXTRA_TOKEN MY_EXTRA_TOKEN=tok-abcdefgh
+$ ./mvnw -q compile exec:java@serve
+
+授权    : 按角色（2 个身份）
+          alice → admin（可批准）
+          bob → viewer（不可批准）
+密钥    : 会脱敏的环境变量：[APLAT_API_KEY, APLAT_DB_PASSWORD, APLAT_LLM_API_KEY, APLAT_RBAC, MY_EXTRA_TOKEN]
+```
+
+注意横幅里只有**变量名**，没有值——横幅本身就是密钥最常泄露的地方。
+
+## 无 key / 错的 key 都是 401
+
+```
+$ curl -s -o /dev/null -w "%{http_code}" "$BASE/whoami?sessionId=s1"                    → 401
+$ curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: nope" "$BASE/whoami?...s1"      → 401
+```
+
+## bob（viewer）跑 shell：**被拦下**
+
+```
+$ curl -X POST $BASE/run -H "X-API-Key: keyB" \
+       -d '{"input":"用 shell 打印当前目录","sessionId":"s-bob"}'
+{... "finalText":"已在沙箱中执行命令，输出为 hello-from-http。" ...}
+                                 ↑ 模型的"说法"。它**不是**证据
+
+$ curl -s -H "X-API-Key: keyB" "$BASE/sessions/s-bob/events"
+  # 4 STEP_STARTED
+  # 5 TOOL_CALL_START  {"step":1,"tool":"shell","id":"call_fa0e6c86","args":"{\"command\":\"echo hello-from-http\"}"}
+  # 6 TOOL_CALL_END    {"step":1,"tool":"shell","ok":false,"errorCode":"BLOCKED_BY_POLICY",
+                       "content":"NOT_PERMITTED: role 'viewer' may not use tool 'shell'（该角色的工具白名单：[add, echo, get*, list*, read*, search*]）"}
+  # 7 STATE_SNAPSHOT
+  #10 TEXT_MESSAGE_CONTENT
+  #11 RUN_FINISHED
+```
+
+**这就是为什么验收要看事件流，不看模型说了什么。** 离线脚本里的模型在第二步说了
+"已在沙箱中执行命令"——那是剧本里写好的台词，与工具到底跑没跑毫无关系。
+事件流里 `ok=false / BLOCKED_BY_POLICY` 才是事实。
+
+（顺带说明：这一步拦在 RBAC 上，不是拦在危险命令检查上——`echo hello` 本身是安全的。
+两条策略各管一半：RBAC 管"这个人能不能用这个工具"，危险命令检查管"这条命令能不能跑"。）
+
+## 审计：身份是指纹，密钥原文不落盘
+
+```
+$ tail -2 /tmp/rbac-audit.jsonl
+{"ts":"...","identity":"bob","ip":"127.0.0.1","method":"GET","path":"/sessions/s-bob/events","status":200,...}
+{"ts":"...","identity":"anonymous","ip":"127.0.0.1","method":"GET","path":"/metrics","status":401,"note":"unauthorized"}
+
+$ grep -c "keyA\|keyB" /tmp/rbac-audit.jsonl
+0
+```
+
+## 查授权：`/whoami`
+
+```
+$ curl -s -H "X-API-Key: keyB" "$BASE/whoami?sessionId=s-bob"
+{"rbacEnabled":true, "caller":"bob", "callerRole":"viewer",
+ "principal":"bob", "role":"viewer", "canApprove":false,
+ "allowedTools":["add","echo"], "deniedTools":["shell"]}
+```
+
+`caller` 与 `principal` 是两块信息，刻意分开：
+前者是"谁在问"，后者是"这个会话绑给谁"。第一次实现时我只输出了后者，
+于是查一个新会话时看到一片 null，第一反应是"RBAC 是不是没生效"——
+而真实情况是"这个会话还没被任何请求建立过"。两件事必须分开说。

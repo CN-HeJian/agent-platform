@@ -1,5 +1,7 @@
 package com.aplat.run;
 
+import com.aplat.auth.Rbac;
+import com.aplat.auth.Secrets;
 import com.aplat.hitl.InteractiveHitl;
 import com.aplat.hitl.ScopedHitl;
 import com.aplat.mcp.McpMount;
@@ -11,11 +13,13 @@ import com.aplat.sandbox.DockerSandbox;
 import com.aplat.sandbox.ProcessSandbox;
 import com.aplat.seam.LlmAdapter;
 import com.aplat.seam.Store;
+import com.aplat.auth.Role;
 import com.aplat.seam.Sandbox;
 import com.aplat.store.StoreFactory;
 import com.aplat.tools.DefaultToolPolicy;
 import com.aplat.web.HttpTransport;
 import com.aplat.web.ServerConfig;
+import com.aplat.web.UiAssets;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -39,6 +43,11 @@ import java.util.List;
  *   # 人工确认（U12）。默认就是 ask：能执行命令的服务，"先问"才是诚实的默认值
  *   export APLAT_HITL=ask              # allow = 不问人直接放行；deny = 直接拒绝
  *   export APLAT_HITL_TIMEOUT_SEC=120  # 无人应答的等待上限
+ *
+ *   # 按角色授权（U25）。不配 = 一个共享 key = 隐含 admin
+ *   export APLAT_RBAC="alice:admin:keyA;bob:viewer:keyB"
+ *   export APLAT_SECRET_ENV="MY_OTHER_TOKEN"   # 额外要脱敏的环境变量（默认已含 API key 等）
+ *   curl -s -H "X-API-Key: keyB" "$BASE/whoami?sessionId=s1"   # 看某个会话的实际授权
  *
  *   # MCP 接入（U24）。端点是一行命令，多个用 ; 分隔
  *   export APLAT_MCP_ENDPOINTS="python3 tools/mcp_server.py"
@@ -99,8 +108,29 @@ public final class Serve {
         // 而日志是内核建的——所以它只能在装配过程里被创建（见 Platform 的注释）。
         // 外面再套一层 ScopedHitl：定时任务可以带一份"提前批准"的豁免名单（U22），
         // 而那份名单只在那条调度自己的线程上有效。不套的话，调度里的"提前批准"根本无处生效。
+        // RBAC（U25）：配了 APLAT_RBAC 就按角色授权，没配就退化成单共享 key（行为与 U16 一致）。
+        // 解析失败**直接退出**：一个"我没看懂你的授权配置"的服务，比一个"我用默认配置跑起来了"
+        // 的服务危险得多——后者会让所有人都是 admin。
+        Rbac rbac;
+        try {
+            rbac = Rbac.fromEnv(System.getenv());
+        } catch (IllegalArgumentException e) {
+            System.err.println("[启动失败] " + e.getMessage());
+            System.err.println("          格式：APLAT_RBAC=名字:角色:密钥;名字:角色:密钥");
+            System.err.println("          内置角色：" + Role.all().stream().map(Role::describe).toList());
+            System.exit(2);
+            return;
+        }
+        Secrets secrets = Secrets.fromEnv(System.getenv());
+
+        // 组合策略：RBAC 管"这个人能不能用这个工具"，默认策略管"这条命令能不能跑"。
+        // 两者都必须过——只做前者的话 admin 仍会被危险命令拦，只做后者的话谁都能跑。
+        com.aplat.tools.ToolPolicy policy = rbac.enabled()
+                ? DefaultToolPolicy.fromEnv().and(rbac.policy())
+                : DefaultToolPolicy.fromEnv();
+
         Platform platform = Platform.assemble(llm, sandbox, LoopBudget.defaults(),
-                DefaultToolPolicy.fromEnv(), store,
+                policy, store,
                 log -> new ScopedHitl(InteractiveHitl.fromEnv(log, System.getenv()), log),
                 reg -> {
                     for (String endpointCommand : mcpEndpoints) {
@@ -140,12 +170,25 @@ public final class Serve {
                 + "；调度 " + platform.scheduler().list().size() + " 条（每 "
                 + platform.scheduler().tickMillis() / 1000 + "s 扫一次）");
 
-        HttpTransport transport = new HttpTransport(platform, config).start();
+        HttpTransport transport = new HttpTransport(platform, config, UiAssets.fromEnv(),
+                rbac, secrets).start();
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             transport.close();
             mounts.forEach(McpMount::unmount); // 先卸 MCP：它们的子进程由我们负责收摊
             platform.close(); // 关掉可关闭的组件（现在是 JDBC store，将来是连接池）
         }, "shutdown"));
+
+        if (rbac.enabled()) {
+            System.out.println("授权    : 按角色（" + rbac.principalCount() + " 个身份）");
+            for (var row : rbac.describe()) {
+                System.out.println("          " + row.get("principal") + " → " + row.get("role")
+                        + (Boolean.TRUE.equals(row.get("canApprove")) ? "（可批准）" : "（不可批准）"));
+            }
+        } else {
+            System.out.println("授权    : 单一共享 key（未配 " + Rbac.ENV_RBAC
+                    + "）；配了它就按角色授权");
+        }
+        System.out.println("密钥    : " + secrets.describe());
 
         String base = transport.baseUrl();
         System.out.println();

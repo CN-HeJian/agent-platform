@@ -36,6 +36,22 @@ public interface ToolPolicy {
         }
     }
 
+    /**
+     * 组合两个策略：**任一拒绝就拒绝**（先问这个，过了再问那个）。
+     *
+     * <p>存在的理由：RBAC（"这个人能不能用这个工具"）与危险命令检查（"这条命令能不能跑"）
+     * 是两件事，各管一半。合成一个策略类会让两者的测试互相纠缠，而组合子让它们各自独立可测。
+     *
+     * <p>短路在**第一个拒绝**处停下：第二个策略只在第一个放行时才被问到，
+     * 于是"没有身份"这种情况不会被危险命令检查的日志刷一遍。
+     */
+    default ToolPolicy and(ToolPolicy other) {
+        return (sessionId, spec, argumentsJson) -> {
+            Decision first = check(sessionId, spec, argumentsJson);
+            return first.allowed() ? other.check(sessionId, spec, argumentsJson) : first;
+        };
+    }
+
     /** 只用于测试与"确实不需要策略"的场景；生产装配默认用 {@link DefaultToolPolicy}。 */
     static ToolPolicy allowAll() {
         return (sessionId, spec, argumentsJson) -> Decision.allow();

@@ -35,6 +35,9 @@ public final class AuditLog implements AutoCloseable {
     /** 默认保留最近多少条在内存里（够 /audit 页看现场）。 */
     public static final int DEFAULT_CAPACITY = 500;
 
+    /** 脱敏器（U25）。null = 不脱敏（测试与"确实没有密钥"的场景）。 */
+    private com.aplat.auth.Secrets secrets;
+
     /** 写盘队列上限。满了就丢并计 dropped —— 审计不能反压业务。 */
     private static final int QUEUE_CAPACITY = 4_096;
 
@@ -76,10 +79,17 @@ public final class AuditLog implements AutoCloseable {
     /**
      * 记一条。**不阻塞、不抛异常**——审计失败不该影响请求本身。
      */
+    public AuditLog redacting(com.aplat.auth.Secrets secrets) {
+        this.secrets = secrets;
+        return this;
+    }
+
     public void record(RequestAudit audit) {
         if (audit == null) {
             return;
         }
+        // 唯一的落库出口，所以脱敏放在这里：调用方不需要记得"别忘了脱敏"
+        audit = audit.redactedBy(secrets);
         total.incrementAndGet();
         synchronized (recent) {
             recent.addFirst(audit);

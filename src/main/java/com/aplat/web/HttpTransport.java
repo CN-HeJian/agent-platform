@@ -1,5 +1,7 @@
 package com.aplat.web;
 
+import com.aplat.auth.Rbac;
+import com.aplat.auth.Secrets;
 import com.aplat.hitl.InteractiveHitl;
 import com.aplat.hitl.ScopedHitl;
 import com.aplat.observe.JsonLog;
@@ -86,24 +88,50 @@ public final class HttpTransport implements AutoCloseable {
      * 塞进能力缝会让"自动放行"也得实现一堆空方法——能力缝应当只有一个真实的门控方法。
      */
     private final InteractiveHitl approvals;
+    private final Rbac rbac;
+    private final Secrets secrets;
+
+    /**
+     * 当前请求的身份。
+     *
+     * <p>用 ThreadLocal 而不是一路传参：它的用途是"工具策略要按人判"，
+     * 而那条调用链（HTTP → 循环 → 管线 → 策略）中间隔着好几层不关心身份的代码。
+     *
+     * <p>代价必须写清楚：**它只在请求线程上有效**，任何跨线程的异步都会丢掉它——
+     * 而丢掉的表现是策略"没有身份 → 拒绝"，即失败关门，不是静默放行。
+     */
+    private static final ThreadLocal<Rbac.Principal> CURRENT = new ThreadLocal<>();
     private final HttpServer server;
     private final ScheduledExecutorService heartbeat;
     private final Set<SseWriter> activeStreams = ConcurrentHashMap.newKeySet();
     private final long startedAt = System.currentTimeMillis();
 
     public HttpTransport(Platform platform, ServerConfig config) throws IOException {
-        this(platform, config, UiAssets.fromEnv());
+        this(platform, config, UiAssets.fromEnv(), Rbac.disabled(), Secrets.fromEnv(System.getenv()));
     }
 
     public HttpTransport(Platform platform, ServerConfig config, UiAssets uiAssets) throws IOException {
+        this(platform, config, uiAssets, Rbac.disabled(), Secrets.fromEnv(System.getenv()));
+    }
+
+    /**
+     * 带 RBAC 与密钥脱敏的构造（U25）。
+     *
+     * <p>显式加这个重载而不是"顺便"从配置里读：调用方读到这一行就知道
+     * "这个服务的授权是按角色的"，不必再去翻配置。
+     */
+    public HttpTransport(Platform platform, ServerConfig config, UiAssets uiAssets,
+                         Rbac rbac, Secrets secrets) throws IOException {
         this.platform = platform;
         this.config = config;
         this.guard = new ApiKeyGuard(config.apiKey());
+        this.rbac = rbac;
+        this.secrets = secrets;
         this.uiAssets = uiAssets;
         this.rateLimiter = new RateLimiter(config.rateLimitPerMin());
-        this.auditLog = config.auditFile() == null
+        this.auditLog = (config.auditFile() == null
                 ? AuditLog.inMemory()
-                : AuditLog.toFile(java.nio.file.Path.of(config.auditFile()));
+                : AuditLog.toFile(java.nio.file.Path.of(config.auditFile()))).redacting(secrets);
         // 必须拆包：Serve 把 InteractiveHitl 套进了 ScopedHitl（U22 的提前批准），
         // 不拆的话 instanceof 不成立，审批面板会显示成"当前实现不等人"——
         // 一个纯粹的包装层把功能"关掉"了，而且没有任何报错。
@@ -182,8 +210,22 @@ public final class HttpTransport implements AutoCloseable {
         String method = ex.getRequestMethod().toUpperCase();
         String path = ex.getRequestURI().getPath();
         String clientIp = clientIpOf(ex);
-        java.util.Optional<String> identified =
-                guard.identify(ex.getRequestHeaders()::getFirst, query(ex).get("apiKey"));
+        // RBAC 开启时由它认身份（一个 key 对应一个角色）；未开启时沿用 U16 的单共享 key。
+        // 两条路的"认不出"都必须**拒绝**，而不是退回 anonymous。
+        String rawKey = extractKey(ex, query(ex).get("apiKey"));
+        Rbac.Principal caller = null;
+        java.util.Optional<String> identified;
+        if (rbac.enabled()) {
+            caller = rbac.identify(rawKey).orElse(null);
+            identified = caller == null
+                    ? java.util.Optional.empty()
+                    : java.util.Optional.of(caller.id());
+            if (caller != null) {
+                CURRENT.set(caller);
+            }
+        } else {
+            identified = guard.identify(ex.getRequestHeaders()::getFirst, query(ex).get("apiKey"));
+        }
         // 认不出身份就记 anonymous，**不要**记成"(rejected)"——
         // 身份字段回答的是"谁"，不是"结果"。把结果塞进身份会让
         // "免鉴权的公开资源被放行（200）"也看起来像被拒（我第一版就是这么错的，
@@ -222,6 +264,9 @@ public final class HttpTransport implements AutoCloseable {
                 sendUiAsset(ex, path);
             } else if (path.equals("/kernel") && method.equals("GET")) {
                 sendJson(ex, 200, kernelReport());
+            } else if (path.equals("/whoami") && method.equals("GET")) {
+                sendJson(ex, 200, rbac.explain(query(ex).get("sessionId"),
+                        platform.tools().specs(), CURRENT.get()));
             } else if (path.equals("/metrics") && method.equals("GET")) {
                 sendMetrics(ex, query(ex));
             } else if (path.startsWith("/trace/") && method.equals("GET")) {
@@ -274,7 +319,46 @@ public final class HttpTransport implements AutoCloseable {
         } finally {
             recordAudit(scope, startedAt);
             RequestScope.end();
+            // 线程是复用的：不清掉的话，下一个请求（可能是没带 key 的那个）会继承上一个人的身份
+            CURRENT.remove();
             ex.close();
+        }
+    }
+
+    /**
+     * 从三种携带方式里取**原始** key。
+     *
+     * <p>与 {@code ApiKeyGuard} 的区别：那边校验完只给指纹，而 RBAC 需要拿原值去查表
+     * （表里存的是指纹，但查询动作必须先有原值）。这个方法的结果**只活在这一次调用里**，
+     * 不写日志、不进审计、不进事件。
+     */
+    private static String extractKey(HttpExchange ex, String queryApiKey) {
+        String header = ex.getRequestHeaders().getFirst("X-API-Key");
+        if (header != null && !header.isBlank()) {
+            return header.trim();
+        }
+        String auth = ex.getRequestHeaders().getFirst("Authorization");
+        if (auth != null && auth.regionMatches(true, 0, "Bearer ", 0, 7)) {
+            String token = auth.substring(7).trim();
+            if (!token.isEmpty()) {
+                return token;
+            }
+        }
+        return queryApiKey == null || queryApiKey.isBlank() ? null : queryApiKey.trim();
+    }
+
+    /**
+     * 把会话绑定到当前调用方（U25）。
+     *
+     * <p>工具策略的签名里没有 principal，所以绑定关系由这里登记（见 {@link Rbac} 的注释）。
+     * **每个建立会话的入口都必须调它**——漏一个就是一个"没有身份"的会话，
+     * 而那种会话里所有工具都会被拒。失败关门的代价在这里体现为一句清楚的报错，
+     * 而不是一条绕过授权的旁路。
+     */
+    private void bindSession(String sessionId) {
+        Rbac.Principal principal = CURRENT.get();
+        if (principal != null && sessionId != null && !sessionId.isBlank()) {
+            rbac.bind(sessionId, principal);
         }
     }
 
@@ -340,6 +424,7 @@ public final class HttpTransport implements AutoCloseable {
             return;
         }
         String sessionId = orNewSession(text(node, "sessionId"));
+        bindSession(sessionId); // 建立会话时绑定身份：工具策略要靠它判"这个人能不能用这个工具"
 
         log("run session=" + sessionId + " input=" + abbreviate(input));
         TurnResult result = platform.loop().run(sessionId, input);
@@ -406,6 +491,7 @@ public final class HttpTransport implements AutoCloseable {
 
             SessionLog log = platform.sessionLog();
             String sessionId = input.threadId();
+            bindSession(sessionId);
             long resumeFrom = log.events(sessionId).size();
             subscription = log.subscribe(sessionId, pump);
             pump.beginBackfill(resumeFrom);
@@ -446,6 +532,7 @@ public final class HttpTransport implements AutoCloseable {
             return;
         }
         String sessionId = orNewSession(q.get("sessionId"));
+        bindSession(sessionId);
         long afterSeq = parseLong(q.get("lastEventId"), 0L);
 
         SseWriter writer = null;
@@ -618,6 +705,8 @@ public final class HttpTransport implements AutoCloseable {
                 : platform.hitl().id() + " · " + approvals.pending().size() + " pending");
         // 持久化状态必须在健康检查里：排查"数据为什么丢了"时，第一件事就是看这里
         out.put("store", describeStore());
+        // 只报名字，不报值——这一步本身就是"别把密钥打在横幅里"的示范
+        out.put("secretsRedacted", secrets.names());
         out.put("audit", (auditLog.file() == null ? "memory only" : auditLog.file().toString())
                 + " · total=" + auditLog.total() + " dropped=" + auditLog.dropped());
         return out;
@@ -954,6 +1043,21 @@ public final class HttpTransport implements AutoCloseable {
      * 这个区别对前端有意义——409 时界面应当把卡片撤掉并提示"已超时"，而不是报错误。
      */
     private void handleApproval(HttpExchange ex, String rawRequestId) throws IOException {
+        // 谁能批：RBAC 开启时只有 canApprove 的角色能答。
+        // 放在 approvals == null 判断之前，因为"没开 HITL"与"你没资格批"是两件事，
+        // 而后者不该被前者掩盖。
+        if (rbac.enabled()) {
+            String owner = approvals == null ? null : approvals.pending().stream()
+                    .filter(p -> p.requestId().equals(rawRequestId))
+                    .map(PendingApproval::sessionId)
+                    .findFirst().orElse(null);
+            if (owner != null && !rbac.canApprove(owner)) {
+                sendError(ex, 403, "CANNOT_APPROVE",
+                        "role '" + rbac.principalOf(owner).map(p -> p.role().name()).orElse("?")
+                                + "' may not approve requests（批准是安全决定，与「能不能干活」分开）");
+                return;
+            }
+        }
         if (approvals == null) {
             sendError(ex, 501, "HITL_NOT_INTERACTIVE",
                     "the assembled HITL implementation does not wait for humans; "

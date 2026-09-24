@@ -23,6 +23,22 @@ public record RequestAudit(
         long durationMs,
         String note) {
 
+    /**
+     * 脱敏后再落库（U25）。
+     *
+     * <p>为什么审计这里必须过一道：密钥最常见的泄露路径不是"谁打印了密钥"，
+     * 而是它**随着请求本身**进了审计——{@code ?apiKey=sk-xxx} 会出现在 path 里，
+     * 而路径是审计字段。做法是替换已知的密钥值，不是"猜哪些像密钥"
+     * （正则猜密钥一定会漏，而漏一次就够）。
+     */
+    public RequestAudit redactedBy(com.aplat.auth.Secrets secrets) {
+        if (secrets == null) {
+            return this;
+        }
+        return new RequestAudit(ts, secrets.redact(identity), clientIp, method,
+                secrets.redact(path), status, durationMs, secrets.redact(note));
+    }
+
     public boolean failed() {
         return status == 0 || status >= 400;
     }
