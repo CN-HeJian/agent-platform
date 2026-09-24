@@ -88,6 +88,28 @@
               <mainClass>com.aplat.run.Serve</mainClass>
             </configuration>
           </execution>
+          <!--
+            `exec:exec@mcp-demo`：起一个 MCP 服务端子进程，走完整管线调它的工具。
+
+            注意这里用的是 **exec 而不是 exec:java**：exec:java 在自己的 JVM 里跑，
+            `java.class.path` 是 Maven 的 plexus-classworlds，**拿不到项目类路径**——
+            于是"用当前 JVM 起一个子进程"这种演示会起不来（本项目就踩了这一下）。
+            exec 会 fork 一个真正的 JVM，classpath 是对的。
+          -->
+          <execution>
+            <id>mcp-demo</id>
+            <goals>
+              <goal>exec</goal>
+            </goals>
+            <configuration>
+              <executable>java</executable>
+              <arguments>
+                <argument>-classpath</argument>
+                <classpath/>
+                <argument>com.aplat.run.McpDemo</argument>
+              </arguments>
+            </configuration>
+          </execution>
           <!-- `exec:java@crash -Dexec.args="u20 crash r1"`：真的 halt 掉进程，验证跨进程续跑 -->
           <execution>
             <id>crash</id>

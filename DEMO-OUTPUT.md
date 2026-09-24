@@ -1022,3 +1022,49 @@ mysql> SELECT session_id, next_seq FROM aplat_session_seq WHERE session_id LIKE 
 
 它同时意味着：**同一个 task 的同一个 step 的同一个 call id，一辈子只执行一次**。
 键里带上 taskId 与 callId 正是为了让"不同任务/不同调用"互不牵连。
+
+---
+
+# U24 MCP：接入一个真的子进程
+
+对端是同一份代码里的 `mcp/StdioMcpServer`（一个 100 行的极简 MCP 服务端），
+通过 stdio 说 JSON-RPC。用当前 JVM 起子进程——**同一 JVM 里 mock 传输层验的只是
+"我写的代码调了我写的代码"**，而这一层要证明的恰恰是跨进程的东西。
+
+```
+$ ./mvnw -q compile exec:exec@mcp-demo
+=== MCP 演示 ===
+对端命令 : .../java -cp target/classes:... com.aplat.mcp.StdioMcpServer
+
+挂载结果 : 成功，挂上 2 个工具
+  mcp_demo_echo          commandField=null      需确认=false   ← 显式信任
+  mcp_demo_run_command   commandField=command   需确认=true    ← 执行类，必须确认
+
+任务结果 : SUCCEEDED / 两个远端工具都调过了。
+
+--- 事件流（工具部分）---
+  tool.result tool=mcp_demo_echo         ok=true content=echo: 来自模型的问候
+  tool.result tool=mcp_demo_run_command  ok=true content=我是远端子进程，pid=23492
+                                                    ↑ 这个 pid 是**子进程**的，不是演示进程的
+
+--- 追踪（投影出来的 span 树）---
+  tool mcp_demo_echo         14ms  已结束
+  tool mcp_demo_run_command  21ms  已结束
+
+会话事件总数 = 19，开口 span = 0
+已卸载：3 个工具残留（MCP 工具都收回了）
+```
+
+## 走这条路时踩到的两个坑
+
+**① `exec:java` 下拿不到项目类路径。** 演示要"用当前 JVM 起一个子进程"，
+于是读了 `System.getProperty("java.class.path")`。在 `mvn test`（surefire fork 出真 JVM）
+下是对的，但 `exec:java` 是**在 Maven 自己的 JVM 里**跑，那个属性指向
+plexus-classworlds，于是子进程一启动就 ClassNotFound——而现象是"健康检查失败"，
+看起来像 MCP 客户端有问题。改用 `exec:exec`（fork 一个真 JVM）。这条已经写进 POM 注释，
+因为下一个想加演示入口的人一定会再踩一次。
+
+**② 前缀从整条命令行猜出来必然难看。** 第一版把工具名前缀算成"命令行的最后一段"，
+于是得到 `mcp_protobuf_java_4_29_0_echo`——因为命令行里塞着一长串 classpath。
+现在前缀**可以显式指定**（推荐），不指定时取最后一个参数的 basename 去扩展名；
+再猜不出来就退化成一个短哈希（短很重要：前缀会出现在每个工具名里，而工具名进模型上下文）。

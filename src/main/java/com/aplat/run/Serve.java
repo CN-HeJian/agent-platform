@@ -2,6 +2,8 @@ package com.aplat.run;
 
 import com.aplat.hitl.InteractiveHitl;
 import com.aplat.hitl.ScopedHitl;
+import com.aplat.mcp.McpMount;
+import com.aplat.mcp.StdioMcpClient;
 import com.aplat.llm.OpenAiCompatibleAdapter;
 import com.aplat.llm.ScriptedLlmAdapter;
 import com.aplat.loop.LoopBudget;
@@ -14,6 +16,8 @@ import com.aplat.store.StoreFactory;
 import com.aplat.tools.DefaultToolPolicy;
 import com.aplat.web.HttpTransport;
 import com.aplat.web.ServerConfig;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * 起服务：把薄内核挂到 HTTP + SSE 上（U02 的入口）。
@@ -35,6 +39,10 @@ import com.aplat.web.ServerConfig;
  *   # 人工确认（U12）。默认就是 ask：能执行命令的服务，"先问"才是诚实的默认值
  *   export APLAT_HITL=ask              # allow = 不问人直接放行；deny = 直接拒绝
  *   export APLAT_HITL_TIMEOUT_SEC=120  # 无人应答的等待上限
+ *
+ *   # MCP 接入（U24）。端点是一行命令，多个用 ; 分隔
+ *   export APLAT_MCP_ENDPOINTS="python3 tools/mcp_server.py"
+ *   export APLAT_MCP_TRUSTED=echo,get_weather   # 免确认名单（精确名字，不接通配）
  *
  *   # 持久化（U18）。不设 = 内存，重启即丢
  *   export APLAT_DB_URL=jdbc:mysql://127.0.0.1:3306/aplat
@@ -81,13 +89,27 @@ public final class Serve {
         // 因为"配了库却悄悄退回内存"是最糟的结果：跑得好好的，直到重启才发现数据全丢了。
         Store store = StoreFactory.fromEnv();
 
+        // MCP 接入（U24）：端点来自环境变量，**一个端点一个子进程**（stdio 传输天然如此）。
+        // 挂载失败不抛异常——一个 MCP 端点挂掉不该让服务起不来——但结果会被打出来。
+        List<String> mcpEndpoints = McpMount.endpointsFromEnv(System.getenv());
+        List<McpMount> mounts = new ArrayList<>();
+        List<McpMount.Mounted> mcpResults = new ArrayList<>();
+
         // HITL 走工厂：InteractiveHitl 要把 hitl.requested 写进会话日志，
         // 而日志是内核建的——所以它只能在装配过程里被创建（见 Platform 的注释）。
-        // HITL 外面再套一层 ScopedHitl：定时任务可以带一份"提前批准"的豁免名单（U22），
-        // 而那份名单只在那条调度自己的线程上有效。不套的话，调度里"提前批准"根本无处生效。
+        // 外面再套一层 ScopedHitl：定时任务可以带一份"提前批准"的豁免名单（U22），
+        // 而那份名单只在那条调度自己的线程上有效。不套的话，调度里的"提前批准"根本无处生效。
         Platform platform = Platform.assemble(llm, sandbox, LoopBudget.defaults(),
                 DefaultToolPolicy.fromEnv(), store,
-                log -> new ScopedHitl(InteractiveHitl.fromEnv(log, System.getenv()), log));
+                log -> new ScopedHitl(InteractiveHitl.fromEnv(log, System.getenv()), log),
+                reg -> {
+                    for (String endpointCommand : mcpEndpoints) {
+                        McpMount mount = McpMount.fromEnv(reg,
+                                new StdioMcpClient(endpointCommand), System.getenv());
+                        mcpResults.addAll(mount.mount(List.of(endpointCommand)));
+                        mounts.add(mount);
+                    }
+                });
 
         // 启动顺序（U22）：先认领孤儿，再开调度。
         // 反过来的话，一条上次崩在跑的任务会被调度器看成"还在跑"，
@@ -104,6 +126,14 @@ public final class Serve {
         System.out.println("Sandbox : " + sandbox.description());
         System.out.println("HITL    : " + platform.hitl().id());
         System.out.println("Store   : " + describeStore(store));
+        for (McpMount.Mounted m : mcpResults) {
+            System.out.println("MCP     : " + (m.healthy()
+                    ? "已挂载 " + m.toolNames().size() + " 个工具 ← " + m.endpoint()
+                    : "⚠ 未挂载（" + m.failure() + "）← " + m.endpoint()));
+        }
+        if (mcpEndpoints.isEmpty()) {
+            System.out.println("MCP     : 未配置（设 APLAT_MCP_ENDPOINTS=<一行命令> 接入，见 README）");
+        }
         System.out.println("耐久    : 任务 "
                 + platform.durable().list().size() + " 条"
                 + (reclaimed > 0 ? "，启动时认领孤儿 " + reclaimed + " 条（可续跑）" : "")
@@ -113,6 +143,7 @@ public final class Serve {
         HttpTransport transport = new HttpTransport(platform, config).start();
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             transport.close();
+            mounts.forEach(McpMount::unmount); // 先卸 MCP：它们的子进程由我们负责收摊
             platform.close(); // 关掉可关闭的组件（现在是 JDBC store，将来是连接池）
         }, "shutdown"));
 

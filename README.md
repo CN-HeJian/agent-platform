@@ -31,6 +31,7 @@
 | **追踪（U23）** | `observe/TraceBuilder` + `GET /trace/{sid}` | ✅ span 树从事件流**投影**；崩溃的会话也有完整一棵 |
 | **指标（U23）** | `observe/Metrics` + `GET /metrics` | ✅ JSON 与 Prometheus 两种；重启后不清零 |
 | **结构化日志（U23）** | `observe/JsonLog` | ✅ 服务日志一行一条 JSON（业务事件另走事件流） |
+| **MCP 接入（U24）** | `mcp/`（stdio JSON-RPC） | ✅ 真子进程验证；远端工具**默认要确认** |
 | 装配根 | `run/Platform` | ✅ |
 | **HTTP + SSE 传输层（U02）** | `web/` | ✅ 零新增依赖（JDK HttpServer + 虚拟线程） |
 | **AG-UI 规范端点（U08）** | `session/AgUiProjector` + `POST /agui/run` | ✅ 事件形状符合规范，客户端可直连 |
@@ -42,8 +43,8 @@
 | **工具卡片 + 过程时间线（U07b）** | `ui/src/ToolCard.tsx` · `ui/src/Timeline.tsx` | ✅ 工具参数/结果可视化；原始事件实时可见 |
 | **人工确认 HITL（U12/U13）** | `hitl/InteractiveHitl` + `ui/src/ApprovalPanel.tsx` | ✅ once / always / deny / modify / timeout 五条路径，全程留痕 |
 
-**尚未做**（按计划属后续需求单元）：MCP 接入（U24）、RBAC 与密钥（U25）、
-容器化（U26）、评测飞轮（U27/U28）、平台化（U29–U33）。
+**尚未做**（按计划属后续需求单元）：RBAC 与密钥（U25）、容器化（U26）、
+评测飞轮（U27/U28）、平台化（U29–U33）。
 
 ---
 
@@ -293,6 +294,36 @@ export APLAT_DB_URL='jdbc:mysql://127.0.0.1:3307/aplat' APLAT_DB_USER=root APLAT
 
 注意它**拒绝在内存 Store 下运行**：跨进程验证的前提是两个进程看到同一份状态，
 内存实现下这个演示会"成功"但什么也没证明。
+
+### MCP 接入：远端工具默认要确认（U24）
+
+```bash
+export APLAT_MCP_ENDPOINTS="python3 tools/mcp_server.py"      # 一行命令；多个用 ; 分隔
+export APLAT_MCP_TRUSTED=echo,get_weather                    # 免确认名单（精确名字，不接通配）
+./mvnw -q compile exec:java@serve
+
+# 端到端演示（起一个 MCP 服务端子进程，走完整管线调它的工具）
+./mvnw -q compile exec:exec@mcp-demo
+```
+
+**最重要的是默认值倒了。** 本地工具的危险性是**我们知道**的（`ToolSpec.commandField`
+声明了哪个参数是命令）；远端工具的危险性我们不知道——MCP 的 `tools/list` 里没有
+"我会执行命令"这个字段。所以接进来的工具**默认一律要人工确认**，只有显式列进
+`APLAT_MCP_TRUSTED` 的才免确认。老默认（"没声明就不是执行类，直接放行"）在接进一个
+远端 shell 服务时会**静默地**让整条危险命令检查失效，而"工具列表里多了个工具"这件事
+本身不会引起任何人注意。
+
+信任名单是**按名字精确匹配**的，不接受通配——通配会把"我只信任这两个"悄悄变成"我信任所有"。
+
+另外三处取舍：
+
+- **工具名带前缀**（`mcp_<端点名>_<原名>`）：两个 filesystem 服务都会提供 `read_file`，
+  不加前缀就会在注册表里静默互相覆盖。前缀可以显式指定，不指定就按命令行末段猜一个。
+- **一个守护读线程按 id 派发**，而不是"发一次读一次"：对端可能先发通知再发响应
+  （同步读会读到通知），也可能在没有任何请求时推送消息。读不懂的行只记一笔不退出——
+  对端把日志打到 stdout 是 MCP 最经典的调试坑，一行噪声不该杀掉整条连接。
+- **降级而不是失败**：端点起不来只记一笔并返回 failure，不抛。一个 MCP 端点挂掉不该让
+  整个服务起不来；但也不能静默——启动横幅会打出"⚠ 未挂载（原因）"。
 
 ### 可观测：追踪是投影出来的（U23）
 
